@@ -1,0 +1,55 @@
+[package]
+name = "consolate"
+version = "0.1.0"
+authors = ["Kieran Siek <git@siek.dev>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# UTF-8 Paths
+camino = "1.1.9"
+# Argument parser
+clap = { version = "4.5.27", features = ["derive"] }
+# Binary error handling
+color-eyre = "0.6.3"
+# Colored strings
+owo-colors = "4.1.0"
+# Library error types
+thiserror = "2.0.11"
+# Logging utilities
+time = { version = "0.3.37", features = ["formatting"] }
+tracing = "0.1.41"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
+
+# TUI
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serial port
+tokio-serial = "5.4"
+
+# Pattern matching
+regex = "1"
+
+# Terminal emulator
+vt100 = "0.16"
+futures-util = "0.3.31"
+futures = "0.3.31"
+tokio-util = "0.7.18"
+smallvec = "1.15.1"
+tokio-stream = "0.1.18"
+
+# Build `backtrace` with optimizations for `color-eyre` performance
+[profile.dev.package.backtrace]
+opt-level = 3
+
+[profile.production]
+inherits = "release"
+# Enable link time optimization
+lto = true
+# Strip symbols
+strip = true
