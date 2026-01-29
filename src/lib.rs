@@ -9,16 +9,15 @@ pub mod ui;
 pub use color_eyre::Result;
 
 pub fn setup() -> Result<()> {
-    // use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
     // Install error report and panic hooks
     color_eyre::install()?;
 
+    // TODO: Figure out a nice logging method
+    // use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     // Default logging level
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-
+    // if std::env::var("RUST_LOG").is_err() {
+    //     std::env::set_var("RUST_LOG", "info");
+    // }
     // let filter_layer = EnvFilter::try_from_default_env().or_else(|e| {
     //     eprintln!("Invalid EnvFilter env: {e}, defaulting to info");
     //     EnvFilter::try_new("info")
