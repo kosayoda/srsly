@@ -308,32 +308,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "consolate"
-version = "0.1.0"
-dependencies = [
- "camino",
- "clap",
- "color-eyre",
- "crossterm 0.28.1",
- "futures",
- "futures-util",
- "owo-colors 4.1.0",
- "ratatui",
- "regex",
- "smallvec",
- "thiserror 2.0.11",
- "time",
- "tokio",
- "tokio-serial",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-error",
- "tracing-subscriber",
- "vt100",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1618,6 +1592,32 @@ checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "srsly"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "clap",
+ "color-eyre",
+ "crossterm 0.28.1",
+ "futures",
+ "futures-util",
+ "owo-colors 4.1.0",
+ "ratatui",
+ "regex",
+ "smallvec",
+ "thiserror 2.0.11",
+ "time",
+ "tokio",
+ "tokio-serial",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
+ "vt100",
 ]
 
 [[package]]

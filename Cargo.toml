@@ -1,5 +1,5 @@
 [package]
-name = "consolate"
+name = "srsly"
 version = "0.1.0"
 authors = ["Kieran Siek <git@siek.dev>"]
 edition = "2021"

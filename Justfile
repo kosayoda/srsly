@@ -1,4 +1,4 @@
-project := "consolate"
+project := "srsly"
 
 export RUST_BACKTRACE := "1"
 export RUST_LOG := project + "=trace"

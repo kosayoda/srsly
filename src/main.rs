@@ -2,15 +2,15 @@ use clap::Parser;
 use color_eyre::eyre::bail;
 use color_eyre::Result;
 
-use consolate::app::App;
-use consolate::input::{handle_key, handle_mouse, handle_paste, KeyAction};
-use consolate::serial::{self, SerialConfig, SerialWriter};
-use consolate::tui::{Event, TerminalEvent, Tui, TuiConfig};
-use consolate::ui;
+use srsly::app::App;
+use srsly::input::{handle_key, handle_mouse, handle_paste, KeyAction};
+use srsly::serial::{self, SerialConfig, SerialWriter};
+use srsly::tui::{Event, TerminalEvent, Tui, TuiConfig};
+use srsly::ui;
 
 /// A TUI serial console that separates kernel and application messages.
 #[derive(Parser, Debug)]
-#[command(name = "consolate", version, about)]
+#[command(name = "srsly", version, about)]
 struct Args {
     /// Serial port device path
     #[arg(short, long, default_value = "/dev/ttyUSB0")]
@@ -23,7 +23,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    consolate::setup()?;
+    srsly::setup()?;
 
     let args = Args::parse();
 
