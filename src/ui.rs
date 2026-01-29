@@ -8,34 +8,55 @@ use ratatui::{
 
 use crate::app::{App, Focus, Layout as AppLayout, Mode};
 
+/// Computed layout areas for the UI.
+pub struct UiLayout {
+    pub kernel_pane: Rect,
+    pub app_pane: Rect,
+    pub keybinds: Rect,
+}
+
+impl UiLayout {
+    /// Compute layout areas from frame size and layout mode.
+    pub fn compute(frame_size: Rect, layout: AppLayout) -> Self {
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(frame_size);
+
+        let content_area = main_chunks[0];
+        let keybinds = main_chunks[1];
+
+        let direction = match layout {
+            AppLayout::Vertical => Direction::Horizontal,
+            AppLayout::Horizontal => Direction::Vertical,
+        };
+
+        let pane_chunks = Layout::default()
+            .direction(direction)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(content_area);
+
+        Self {
+            kernel_pane: pane_chunks[0],
+            app_pane: pane_chunks[1],
+            keybinds,
+        }
+    }
+
+    /// Get pane areas as tuple (kernel, app) for hit testing.
+    pub fn pane_areas(&self) -> (Rect, Rect) {
+        (self.kernel_pane, self.app_pane)
+    }
+}
+
 /// Render the application UI.
 pub fn render(frame: &mut Frame, app: &App) {
-    let size = frame.area();
-
-    // Split into main content area and keybinds bar at bottom
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
-        .split(size);
-
-    let content_area = main_chunks[0];
-    let keybinds_area = main_chunks[1];
-
-    // Split content area based on current layout
-    let direction = match app.layout {
-        AppLayout::Vertical => Direction::Horizontal,
-        AppLayout::Horizontal => Direction::Vertical,
-    };
-
-    let pane_chunks = Layout::default()
-        .direction(direction)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(content_area);
+    let layout = UiLayout::compute(frame.area(), app.layout);
 
     // Render kernel pane
     render_terminal_pane(
         frame,
-        pane_chunks[0],
+        layout.kernel_pane,
         "Kernel",
         app.kernel_terminal.screen(),
         app.kernel_terminal.scroll_offset(),
@@ -46,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Render app pane
     render_terminal_pane(
         frame,
-        pane_chunks[1],
+        layout.app_pane,
         "App",
         app.app_terminal.screen(),
         app.app_terminal.scroll_offset(),
@@ -55,7 +76,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
 
     // Render keybinds bar
-    render_keybinds(frame, keybinds_area, app);
+    render_keybinds(frame, layout.keybinds, app);
 }
 
 /// Render a vt100 terminal pane.
@@ -233,17 +254,13 @@ fn color_to_ratatui(color: vt100::Color) -> Color {
 /// Calculate the inner pane size after accounting for borders and padding.
 /// Returns (rows, cols) for terminal emulators.
 pub fn pane_inner_size(frame_size: Rect, layout: AppLayout) -> (u16, u16) {
-    // Account for keybinds bar (1 row)
-    let content_height = frame_size.height.saturating_sub(1);
-
-    let (pane_height, pane_width) = match layout {
-        AppLayout::Vertical => (content_height, frame_size.width / 2),
-        AppLayout::Horizontal => (content_height / 2, frame_size.width),
-    };
+    let ui_layout = UiLayout::compute(frame_size, layout);
+    // Use app_pane dimensions (same as kernel_pane with 50/50 split)
+    let pane = ui_layout.app_pane;
 
     // Account for border (2) and horizontal padding (2)
-    let inner_rows = pane_height.saturating_sub(2);
-    let inner_cols = pane_width.saturating_sub(4);
+    let inner_rows = pane.height.saturating_sub(2);
+    let inner_cols = pane.width.saturating_sub(4);
 
     (inner_rows, inner_cols)
 }

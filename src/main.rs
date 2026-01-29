@@ -2,7 +2,7 @@ use clap::Parser;
 use color_eyre::Result;
 
 use consolate::app::App;
-use consolate::input::{handle_key, KeyAction};
+use consolate::input::{handle_key, handle_mouse, handle_paste, KeyAction};
 use consolate::serial::{self, SerialConfig};
 use consolate::tui::{Event, TerminalEvent, Tui, TuiConfig};
 use consolate::ui;
@@ -77,11 +77,19 @@ async fn main() -> Result<()> {
                     let (rows, cols) = ui::pane_inner_size(frame_size, app.layout);
                     app.resize(rows, cols);
                 }
-                TerminalEvent::FocusGained
-                | TerminalEvent::FocusLost
-                | TerminalEvent::Paste(_)
-                | TerminalEvent::Mouse(_)
-                | TerminalEvent::Error(_) => {}
+                TerminalEvent::Paste(text) => {
+                    if let KeyAction::Send(bytes) = handle_paste(&app, &text) {
+                        if let Err(e) = serial_writer.send_key(bytes).await {
+                            tracing::error!("Failed to send paste: {}", e);
+                        }
+                    }
+                }
+                TerminalEvent::Mouse(mouse) => {
+                    let layout = ui::UiLayout::compute(frame_size, app.layout);
+                    handle_mouse(&mut app, mouse, layout.pane_areas());
+                }
+                TerminalEvent::FocusGained | TerminalEvent::FocusLost | TerminalEvent::Error(_) => {
+                }
             },
         }
 

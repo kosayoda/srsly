@@ -1,4 +1,5 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use smallvec::{smallvec, SmallVec};
 
 use crate::app::{App, Focus, Mode};
@@ -21,6 +22,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
         Mode::Insert => handle_insert_mode(app, key),
         Mode::Normal => handle_normal_mode(app, key),
     }
+}
+
+/// Handle a paste event. Only sends to serial in Insert mode.
+pub fn handle_paste(app: &App, text: &str) -> KeyAction {
+    match app.mode {
+        Mode::Insert => KeyAction::Send(text.as_bytes().into()),
+        Mode::Normal => KeyAction::None,
+    }
+}
+
+/// Handle a mouse event. Click to focus a pane.
+/// `pane_areas` should be (kernel_area, app_area).
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, pane_areas: (Rect, Rect)) -> KeyAction {
+    let (kernel_area, app_area) = pane_areas;
+
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        let x = mouse.column;
+        let y = mouse.row;
+
+        if kernel_area.contains((x, y).into()) {
+            app.focus = Focus::Kernel;
+        } else if app_area.contains((x, y).into()) {
+            app.focus = Focus::App;
+        }
+    }
+
+    KeyAction::None
 }
 
 /// Insert mode: all keys go to serial, except Esc.
