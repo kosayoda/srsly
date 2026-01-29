@@ -101,6 +101,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
             KeyAction::None
         }
 
+        // Clear focused pane
+        KeyCode::Char('c') => {
+            focused_terminal(app).clear();
+            KeyAction::None
+        }
+
         // Unknown command - ignore
         _ => KeyAction::None,
     }

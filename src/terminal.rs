@@ -91,4 +91,15 @@ impl Terminal {
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_len
     }
+
+    /// Clear the screen and scrollback, reset to bottom.
+    pub fn clear(&mut self) {
+        // Send clear screen + cursor home sequences to the parser
+        // \x1b[2J = clear entire screen
+        // \x1b[H = cursor to home position
+        // \x1b[3J = clear scrollback (xterm extension)
+        self.parser.process(b"\x1b[2J\x1b[H\x1b[3J");
+        self.scroll_offset = 0;
+        self.scrollback_len = 0;
+    }
 }

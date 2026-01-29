@@ -173,7 +173,9 @@ fn render_keybinds(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("w", key_style),
                 Span::raw(": Switch pane  "),
                 Span::styled("j/k", key_style),
-                Span::raw(": Scroll"),
+                Span::raw(": Scroll  "),
+                Span::styled("c", key_style),
+                Span::raw(": Clear"),
             ],
         ),
     };
