@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{ensure, Result};
+use color_eyre::eyre::{Result, ensure};
 
 use crossterm::{
     cursor,

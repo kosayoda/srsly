@@ -1,9 +1,10 @@
-use clap::Parser;
-use color_eyre::eyre::bail;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
+use color_eyre::eyre::bail;
+use owo_colors::OwoColorize;
 
 use srsly::app::App;
-use srsly::input::{handle_key, handle_mouse, handle_paste, KeyAction};
+use srsly::input::{KeyAction, handle_key, handle_mouse, handle_paste};
 use srsly::serial::{self, SerialConfig, SerialWriter};
 use srsly::tui::{Event, TerminalEvent, Tui, TuiConfig};
 use srsly::ui;
@@ -12,23 +13,94 @@ use srsly::ui;
 #[derive(Parser, Debug)]
 #[command(name = "srsly", version, about)]
 struct Args {
-    /// Serial port device path
-    #[arg(short, long, default_value = "/dev/ttyUSB0")]
-    port: String,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Baud rate
-    #[arg(short, long, default_value_t = 115200)]
-    baud: u32,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// List available serial ports
+    List,
+    /// Connect to a serial port (default)
+    Connect {
+        /// Serial port device path
+        #[arg(short, long)]
+        port: String,
+
+        /// Baud rate
+        #[arg(short, long, default_value_t = 115200)]
+        baud: u32,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     srsly::setup()?;
 
-    let args = Args::parse();
+    let Args { command } = Args::parse();
 
+    match command {
+        Command::List => {
+            list_ports();
+            return Ok(());
+        }
+        Command::Connect { port, baud } => {
+            run_connect(&port, baud).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn list_ports() {
+    let ports = tokio_serial::available_ports();
+    match ports {
+        Ok(ports) if ports.is_empty() => {
+            println!("{}", "No serial ports found.".yellow());
+        }
+        Ok(ports) => {
+            println!("{}", "Available serial ports:".bold());
+
+            for port in ports {
+                println!("  {}", port.port_name.cyan().bold());
+                match port.port_type {
+                    tokio_serial::SerialPortType::UsbPort(info) => {
+                        if let Some(manufacturer) = &info.manufacturer {
+                            println!("    {}: {}", "Manufacturer".dimmed(), manufacturer);
+                        }
+                        if let Some(product) = &info.product {
+                            println!("    {}: {}", "Product".dimmed(), product.green());
+                        }
+                        if let Some(serial) = &info.serial_number {
+                            println!("    {}: {}", "Serial".dimmed(), serial);
+                        }
+                        println!(
+                            "    {}: {}",
+                            "VID:PID".dimmed(),
+                            format!("{:04x}:{:04x}", info.vid, info.pid).yellow()
+                        );
+                    }
+                    tokio_serial::SerialPortType::BluetoothPort => {
+                        println!("    {}: {}", "Type".dimmed(), "Bluetooth".blue());
+                    }
+                    tokio_serial::SerialPortType::PciPort => {
+                        println!("    {}: {}", "Type".dimmed(), "PCI".magenta());
+                    }
+                    tokio_serial::SerialPortType::Unknown => {
+                        println!("    {}: {}", "Type".dimmed(), "Unknown".dimmed());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{}: {}", "Error listing ports".red().bold(), e);
+        }
+    }
+}
+
+async fn run_connect(port: &str, baud: u32) -> Result<()> {
     // Serial configuration (kept for reconnection)
-    let serial_config = SerialConfig::new(&args.port, args.baud);
+    let serial_config = SerialConfig::new(port, baud);
 
     // Open serial port
     let (serial_rx, serial_writer) = serial::connect(&serial_config)?;
