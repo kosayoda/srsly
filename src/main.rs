@@ -8,7 +8,7 @@ use srsly::serial::{self, SerialConfig, SerialWriter};
 use srsly::tui::{Event, TerminalEvent, Tui, TuiConfig};
 use srsly::ui;
 
-/// A TUI serial console that separates kernel and application messages.
+/// A TUI serial console that separates kernel and "application" messages.
 #[derive(Parser, Debug)]
 #[command(name = "srsly", version, about)]
 struct Args {
@@ -47,14 +47,29 @@ async fn main() -> Result<()> {
 
     tui.enter(serial_rx)?;
 
+    // Helper to update the TUI's no-response deadline from app state
+    let update_no_response_deadline = |tui: &Tui, app: &App| {
+        if let Some(deadline) = app.no_response_deadline() {
+            tui.set_no_response_deadline(Some(tokio::time::Instant::from_std(deadline)));
+        } else {
+            tui.set_no_response_deadline(None);
+        }
+    };
+
     // Main event loop
     while let Some(event) = tui.next().await {
         match event {
-            Event::Init => {}
+            Event::Init | Event::NoResponseTimeout => {
+                // NoResponseTimeout just triggers a redraw (handled below)
+            }
             Event::AppData(data) => {
+                app.record_receive();
+                tui.set_no_response_deadline(None);
                 app.app_terminal.process(&data);
             }
             Event::KernelData(data) => {
+                app.record_receive();
+                tui.set_no_response_deadline(None);
                 app.kernel_terminal.process(&data);
             }
             Event::SerialError(e) => {
@@ -74,6 +89,9 @@ async fn main() -> Result<()> {
                                     tracing::error!("Failed to send: {}", e);
                                     app.set_disconnected(e.to_string());
                                     serial_writer = None;
+                                } else {
+                                    app.record_send();
+                                    update_no_response_deadline(&tui, &app);
                                 }
                             }
                         }
@@ -108,6 +126,9 @@ async fn main() -> Result<()> {
                                 tracing::error!("Failed to send paste: {}", e);
                                 app.set_disconnected(e.to_string());
                                 serial_writer = None;
+                            } else {
+                                app.record_send();
+                                update_no_response_deadline(&tui, &app);
                             }
                         }
                     }

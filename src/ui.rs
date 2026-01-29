@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, HorizontalAlignment, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
@@ -13,6 +13,16 @@ pub struct UiLayout {
     pub kernel_pane: Rect,
     pub app_pane: Rect,
     pub status_bar: Rect,
+}
+
+/// Parameters for rendering a terminal pane.
+struct PaneParams<'a> {
+    title: &'a str,
+    screen: &'a vt100::Screen,
+    scroll_offset: usize,
+    scrollback_len: usize,
+    focused: bool,
+    no_response: Option<std::time::Duration>,
 }
 
 impl UiLayout {
@@ -54,26 +64,43 @@ impl UiLayout {
 pub fn render(frame: &mut Frame, app: &App) {
     let layout = UiLayout::compute(frame.area(), app.layout);
 
+    // Get "no response" warning for focused pane
+    let no_response = app.waiting_for_response();
+
     // Render kernel pane
     render_terminal_pane(
         frame,
         layout.kernel_pane,
-        "Kernel",
-        app.kernel_terminal.screen(),
-        app.kernel_terminal.scroll_offset(),
-        app.kernel_terminal.scrollback_len(),
-        app.focus == Focus::Kernel,
+        PaneParams {
+            title: "Kernel",
+            screen: app.kernel_terminal.screen(),
+            scroll_offset: app.kernel_terminal.scroll_offset(),
+            scrollback_len: app.kernel_terminal.scrollback_len(),
+            focused: app.focus == Focus::Kernel,
+            no_response: if app.focus == Focus::Kernel {
+                no_response
+            } else {
+                None
+            },
+        },
     );
 
     // Render app pane
     render_terminal_pane(
         frame,
         layout.app_pane,
-        "App",
-        app.app_terminal.screen(),
-        app.app_terminal.scroll_offset(),
-        app.app_terminal.scrollback_len(),
-        app.focus == Focus::App,
+        PaneParams {
+            title: "App",
+            screen: app.app_terminal.screen(),
+            scroll_offset: app.app_terminal.scroll_offset(),
+            scrollback_len: app.app_terminal.scrollback_len(),
+            focused: app.focus == Focus::App,
+            no_response: if app.focus == Focus::App {
+                no_response
+            } else {
+                None
+            },
+        },
     );
 
     // Render status bar (with message in frame title if present)
@@ -81,30 +108,35 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 /// Render a vt100 terminal pane.
-fn render_terminal_pane(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    screen: &vt100::Screen,
-    scroll_offset: usize,
-    scrollback_len: usize,
-    focused: bool,
-) {
-    let border_style = if focused {
+fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
+    let border_style = if params.focused {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let title_suffix = if scroll_offset == 0 {
-        format!("-/{}", scrollback_len)
+    let title_suffix = if params.scroll_offset == 0 {
+        format!("-/{}", params.scrollback_len)
     } else {
-        format!("{}/{}", scroll_offset, scrollback_len)
+        format!("{}/{}", params.scroll_offset, params.scrollback_len)
+    };
+
+    // Build title with optional "no response" warning
+    let title_line: Line = if let Some(duration) = params.no_response {
+        Line::from(vec![
+            Span::raw(format!(" {} ({}) ", params.title, title_suffix)),
+            Span::styled(
+                format!("No response ({}s) ", duration.as_secs()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])
+    } else {
+        Line::from(format!(" {} ({}) ", params.title, title_suffix))
     };
 
     let block = Block::default()
         .padding(Padding::horizontal(1))
-        .title(format!(" {} ({}) ", title, title_suffix))
+        .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -116,7 +148,7 @@ fn render_terminal_pane(
     }
 
     // Build lines from the vt100 screen
-    let (rows, cols) = screen.size();
+    let (rows, cols) = params.screen.size();
     let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
 
     for row in 0..rows.min(inner.height) {
@@ -125,7 +157,7 @@ fn render_terminal_pane(
         let mut current_style = Style::default();
 
         for col in 0..cols.min(inner.width) {
-            if let Some(cell) = screen.cell(row, col) {
+            if let Some(cell) = params.screen.cell(row, col) {
                 let cell_style = cell_to_style(cell);
 
                 if cell_style != current_style {
@@ -151,8 +183,8 @@ fn render_terminal_pane(
     frame.render_widget(paragraph, inner);
 
     // Show cursor if focused
-    if focused && !screen.hide_cursor() {
-        let (cursor_row, cursor_col) = screen.cursor_position();
+    if params.focused && !params.screen.hide_cursor() {
+        let (cursor_row, cursor_col) = params.screen.cursor_position();
         let cursor_x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
         let cursor_y = inner.y + cursor_row.min(inner.height.saturating_sub(1));
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -160,27 +192,26 @@ fn render_terminal_pane(
 }
 
 /// Render the status bar (mode, keybinds, connection status).
-/// Message is shown in the frame's top border title.
+/// Message is shown in the frame's top border title (right-aligned).
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let (rows, cols) = app.app_terminal.size();
 
-    // Build the frame with message in title
-    let title: Line = match &app.message {
-        Some(message) => {
-            let style = match message.level {
-                MessageLevel::Info => Style::default().fg(Color::Green),
-                MessageLevel::Error => Style::default().fg(Color::Red),
-            };
-            Line::from(Span::styled(format!(" {} ", message.text), style))
-        }
-        None => Line::default(),
+    // Build the frame with message in title (right-aligned)
+    let title: Line = if let Some(message) = &app.message {
+        let style = match message.level {
+            MessageLevel::Info => Style::default().fg(Color::Green),
+            MessageLevel::Error => Style::default().fg(Color::Red),
+        };
+        Line::from(Span::styled(format!(" {} ", message.text), style))
+    } else {
+        Line::default()
     };
 
     let block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title_alignment(HorizontalAlignment::Right)
-        .title(title);
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Right);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

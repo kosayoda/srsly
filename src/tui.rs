@@ -30,6 +30,8 @@ pub enum Event {
     KernelData(Vec<u8>),
     /// Serial error.
     SerialError(std::io::Error),
+    /// "No response" timeout reached - trigger UI refresh.
+    NoResponseTimeout,
 }
 
 impl From<TerminalEvent> for Event {
@@ -72,6 +74,9 @@ pub struct Tui {
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
 
+    /// Channel to send "no response" deadline updates to the event loop.
+    no_response_tx: mpsc::Sender<Option<tokio::time::Instant>>,
+
     config: TuiConfig,
 }
 
@@ -79,6 +84,7 @@ impl Tui {
     pub fn new(config: TuiConfig) -> Result<Self> {
         let terminal = ratatui::Terminal::new(Backend::new(std::io::stdout()))?;
         let (event_tx, event_rx) = mpsc::channel(1024);
+        let (no_response_tx, _no_response_rx) = mpsc::channel(16);
         let cancellation_token = CancellationToken::new();
         let task = tokio::spawn(async {});
         Ok(Self {
@@ -87,14 +93,24 @@ impl Tui {
             cancellation_token,
             event_rx,
             event_tx,
+            no_response_tx,
             config,
         })
+    }
+
+    /// Set the deadline for "no response" timeout. Pass None to cancel.
+    pub fn set_no_response_deadline(&self, deadline: Option<tokio::time::Instant>) {
+        let _ = self.no_response_tx.try_send(deadline);
     }
 
     fn start(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
         // Cancel existing task
         self.cancel();
         self.cancellation_token = CancellationToken::new();
+
+        // Create new channel for no-response deadline
+        let (no_response_tx, no_response_rx) = mpsc::channel(16);
+        self.no_response_tx = no_response_tx;
 
         // Get task dependencies
         let _event_tx = self.event_tx.clone();
@@ -103,7 +119,10 @@ impl Tui {
         self.task = tokio::spawn(async move {
             let mut reader = crossterm::event::EventStream::new();
             let mut serial = tokio_stream::wrappers::ReceiverStream::new(serial_rx);
+            let mut no_response_updates =
+                tokio_stream::wrappers::ReceiverStream::new(no_response_rx);
             let mut filter = KernelFilter::new();
+            let mut no_response_deadline: Option<tokio::time::Instant> = None;
 
             macro_rules! try_send {
                 ($event_tx:ident, $event:expr) => {
@@ -120,6 +139,7 @@ impl Tui {
             loop {
                 let crossterm_event = reader.next().fuse();
                 let serial_event = serial.next().fuse();
+                let deadline_update = no_response_updates.next().fuse();
 
                 // Dynamic timeout based on pending kernel line
                 let flush_deadline = filter.next_deadline();
@@ -130,10 +150,29 @@ impl Tui {
                     }
                 };
 
+                // "No response" timeout
+                let no_response_timeout = async {
+                    match no_response_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                };
+
                 tokio::select! {
                     _ = _cancellation_token.cancelled() => {
                         tracing::debug!("Received cancellation notice, exiting");
                         break;
+                    }
+                    new_deadline = deadline_update => {
+                        // Update the no-response deadline
+                        if let Some(deadline) = new_deadline {
+                            no_response_deadline = deadline;
+                        }
+                    }
+                    _ = no_response_timeout => {
+                        // "No response" timeout reached
+                        no_response_deadline = None;
+                        try_send!(_event_tx, Event::NoResponseTimeout);
                     }
                     maybe_serial = serial_event => {
                         use crate::serial::SerialEvent;

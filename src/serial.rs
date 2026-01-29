@@ -55,7 +55,7 @@ impl SerialWriter {
 /// Open a serial port and return channels for reading/writing.
 ///
 /// Returns:
-/// - A receiver for incoming data
+/// - A receiver for incoming data/errors
 /// - A writer handle for sending data
 ///
 /// The serial port is managed by background tasks that handle the actual I/O.

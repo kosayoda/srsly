@@ -1,7 +1,12 @@
+use std::time::{Duration, Instant};
+
 use crate::terminal::Terminal;
 
 /// Default scrollback lines for terminals.
 const SCROLLBACK_LINES: usize = 10_000;
+
+/// How long to wait after sending before showing "no response" warning.
+const NO_RESPONSE_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// Input mode (vim-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,6 +81,10 @@ pub struct App {
     pub connection: ConnectionState,
     /// Transient message to display in the message bar.
     pub message: Option<Message>,
+    /// Last time data was sent to serial (None if never sent).
+    last_send: Option<Instant>,
+    /// Last time data was received from serial (None if never received).
+    last_receive: Option<Instant>,
 }
 
 /// A transient message to display in the UI.
@@ -103,6 +112,54 @@ impl App {
             should_quit: false,
             connection: ConnectionState::default(),
             message: None,
+            last_send: None,
+            last_receive: None,
+        }
+    }
+
+    /// Record that data was sent to serial.
+    /// Only updates the timestamp if we're not already waiting for a response,
+    /// so the "no response" timer shows total wait time.
+    pub fn record_send(&mut self) {
+        if self.last_send.is_none() {
+            self.last_send = Some(Instant::now());
+        }
+    }
+
+    /// Record that data was received from serial.
+    pub fn record_receive(&mut self) {
+        self.last_receive = Some(Instant::now());
+        // Clear any "no response" state when we get data
+        self.last_send = None;
+    }
+
+    /// Check if we're waiting for a response (sent data but no response yet).
+    /// Returns the duration we've been waiting, if applicable.
+    pub fn waiting_for_response(&self) -> Option<Duration> {
+        let send_time = self.last_send?;
+        let elapsed = send_time.elapsed();
+
+        // Only report if we've been waiting longer than threshold
+        // and haven't received anything since sending
+        if elapsed >= NO_RESPONSE_THRESHOLD {
+            match self.last_receive {
+                Some(recv_time) if recv_time > send_time => None,
+                _ => Some(elapsed),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Get the deadline for when "no response" warning should appear.
+    /// Used by the TUI to schedule a refresh.
+    pub fn no_response_deadline(&self) -> Option<Instant> {
+        let send_time = self.last_send?;
+        // If we've already passed the threshold, no need for deadline
+        if send_time.elapsed() >= NO_RESPONSE_THRESHOLD {
+            None
+        } else {
+            Some(send_time + NO_RESPONSE_THRESHOLD)
         }
     }
 
