@@ -111,6 +111,9 @@ async fn main() -> Result<()> {
                                 app.show_error(format!("Reconnect failed: {}", e));
                             }
                         },
+                        KeyAction::SearchChanged => {
+                            app.focused_terminal_mut().update_search_matches();
+                        }
                         KeyAction::None => {}
                     }
                 }

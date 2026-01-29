@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use smallvec::{smallvec, SmallVec};
 
 use crate::app::{App, Focus, Mode};
+use crate::terminal::SearchDirection;
 
 /// Result of handling a key event.
 pub enum KeyAction {
@@ -14,6 +15,8 @@ pub enum KeyAction {
     LayoutChanged,
     /// Reconnect to serial port.
     Reconnect,
+    /// Search pattern changed, need to update matches.
+    SearchChanged,
     /// No action needed.
     None,
 }
@@ -23,6 +26,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     match app.mode {
         Mode::Insert => handle_insert_mode(app, key),
         Mode::Normal => handle_normal_mode(app, key),
+        Mode::Search => handle_search_mode(app, key),
     }
 }
 
@@ -30,7 +34,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 pub fn handle_paste(app: &mut App, text: &str) -> KeyAction {
     match app.mode {
         Mode::Insert => KeyAction::Send(text.as_bytes().into()),
-        Mode::Normal => {
+        Mode::Normal | Mode::Search => {
             app.show_info("Paste ignored (not in Insert mode)");
             KeyAction::None
         }
@@ -156,7 +160,109 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
             KeyAction::None
         }
 
+        // Enter forward search mode (/)
+        KeyCode::Char('/') => {
+            app.mode = Mode::Search;
+            let search = &mut focused_terminal(app).search;
+            search.clear();
+            search.direction = SearchDirection::Forward;
+            KeyAction::None
+        }
+
+        // Enter backward search mode (?)
+        KeyCode::Char('?') => {
+            app.mode = Mode::Search;
+            let search = &mut focused_terminal(app).search;
+            search.clear();
+            search.direction = SearchDirection::Backward;
+            KeyAction::None
+        }
+
+        // Next match (n) - follows search direction
+        KeyCode::Char('n') => {
+            let terminal = focused_terminal(app);
+            if let Some(m) = terminal.search.next_match() {
+                terminal.scroll_to_match(m);
+            }
+            KeyAction::None
+        }
+
+        // Previous match (N) - opposite of search direction
+        KeyCode::Char('N') => {
+            let terminal = focused_terminal(app);
+            if let Some(m) = terminal.search.prev_match() {
+                terminal.scroll_to_match(m);
+            }
+            KeyAction::None
+        }
+
+        // Clear search highlights
+        KeyCode::Esc => {
+            focused_terminal(app).search.clear();
+            KeyAction::None
+        }
+
         // Unknown command - ignore
+        _ => KeyAction::None,
+    }
+}
+
+/// Search mode: typing updates pattern, Enter/Esc exits.
+fn handle_search_mode(app: &mut App, key: KeyEvent) -> KeyAction {
+    match key.code {
+        // Exit search mode, keep matches
+        KeyCode::Enter => {
+            app.mode = Mode::Normal;
+            let search = &focused_terminal(app).search;
+            if search.matches.is_empty() && !search.pattern.is_empty() {
+                app.show_info("No matches found");
+            }
+            KeyAction::None
+        }
+
+        // Cancel search, clear matches
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            focused_terminal(app).search.clear();
+            KeyAction::None
+        }
+
+        // Delete last character
+        KeyCode::Backspace => {
+            focused_terminal(app).search.pop_char();
+            KeyAction::SearchChanged
+        }
+
+        // Clear entire pattern
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            focused_terminal(app).search.set_pattern(String::new());
+            KeyAction::SearchChanged
+        }
+
+        // Next match
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let terminal = focused_terminal(app);
+            if let Some(m) = terminal.search.next_match() {
+                terminal.scroll_to_match(m);
+            }
+            KeyAction::None
+        }
+
+        // Previous match
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let terminal = focused_terminal(app);
+            if let Some(m) = terminal.search.prev_match() {
+                terminal.scroll_to_match(m);
+            }
+            KeyAction::None
+        }
+
+        // Add character to pattern
+        KeyCode::Char(c) => {
+            focused_terminal(app).search.push_char(c);
+            KeyAction::SearchChanged
+        }
+
         _ => KeyAction::None,
     }
 }

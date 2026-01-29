@@ -16,6 +16,8 @@ pub enum Mode {
     /// Keys are commands (navigation, quit, etc.).
     #[default]
     Normal,
+    /// Searching within panes.
+    Search,
 }
 
 /// Serial connection state.
@@ -117,6 +119,22 @@ impl App {
         }
     }
 
+    /// Get a reference to the focused terminal.
+    pub fn focused_terminal(&self) -> &Terminal {
+        match self.focus {
+            Focus::App => &self.app_terminal,
+            Focus::Kernel => &self.kernel_terminal,
+        }
+    }
+
+    /// Get a mutable reference to the focused terminal.
+    pub fn focused_terminal_mut(&mut self) -> &mut Terminal {
+        match self.focus {
+            Focus::App => &mut self.app_terminal,
+            Focus::Kernel => &mut self.kernel_terminal,
+        }
+    }
+
     /// Record that data was sent to serial.
     /// Only updates the timestamp if we're not already waiting for a response,
     /// so the "no response" timer shows total wait time.
@@ -199,6 +217,7 @@ impl App {
         self.message = None;
     }
 
+    /// Resize both terminal panes.
     /// Resize both terminal panes.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.app_terminal.set_size(rows, cols);

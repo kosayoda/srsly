@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ConnectionState, Focus, Layout as AppLayout, MessageLevel, Mode};
+use crate::terminal::{SearchDirection, Terminal};
 
 /// Computed layout areas for the UI.
 pub struct UiLayout {
@@ -18,9 +19,7 @@ pub struct UiLayout {
 /// Parameters for rendering a terminal pane.
 struct PaneParams<'a> {
     title: &'a str,
-    screen: &'a vt100::Screen,
-    scroll_offset: usize,
-    scrollback_len: usize,
+    terminal: &'a Terminal,
     focused: bool,
     no_response: Option<std::time::Duration>,
 }
@@ -73,9 +72,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         layout.kernel_pane,
         PaneParams {
             title: "Kernel",
-            screen: app.kernel_terminal.screen(),
-            scroll_offset: app.kernel_terminal.scroll_offset(),
-            scrollback_len: app.kernel_terminal.scrollback_len(),
+            terminal: &app.kernel_terminal,
             focused: app.focus == Focus::Kernel,
             no_response: if app.focus == Focus::Kernel {
                 no_response
@@ -91,9 +88,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         layout.app_pane,
         PaneParams {
             title: "App",
-            screen: app.app_terminal.screen(),
-            scroll_offset: app.app_terminal.scroll_offset(),
-            scrollback_len: app.app_terminal.scrollback_len(),
+            terminal: &app.app_terminal,
             focused: app.focus == Focus::App,
             no_response: if app.focus == Focus::App {
                 no_response
@@ -109,16 +104,19 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 /// Render a vt100 terminal pane.
 fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
+    let terminal = params.terminal;
+    let screen = terminal.screen();
+
     let border_style = if params.focused {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let title_suffix = if params.scroll_offset == 0 {
-        format!("-/{}", params.scrollback_len)
+    let title_suffix = if terminal.scroll_offset() == 0 {
+        format!("-/{}", terminal.scrollback_len())
     } else {
-        format!("{}/{}", params.scroll_offset, params.scrollback_len)
+        format!("{}/{}", terminal.scroll_offset(), terminal.scrollback_len())
     };
 
     // Build title with optional "no response" warning
@@ -148,17 +146,36 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
     }
 
     // Build lines from the vt100 screen
-    let (rows, cols) = params.screen.size();
+    let (rows, cols) = screen.size();
     let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
 
     for row in 0..rows.min(inner.height) {
+        let view_row = row as usize;
         let mut spans: Vec<Span> = Vec::new();
         let mut current_text = String::new();
         let mut current_style = Style::default();
 
         for col in 0..cols.min(inner.width) {
-            if let Some(cell) = params.screen.cell(row, col) {
-                let cell_style = cell_to_style(cell);
+            if let Some(cell) = screen.cell(row, col) {
+                // Check if this cell is part of a search match (using view row)
+                let in_current_match = terminal.is_current_match(view_row, col as usize);
+                let in_any_match = terminal.is_any_match(view_row, col as usize);
+
+                let cell_style = if in_current_match {
+                    // Current match: bright yellow background
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else if in_any_match {
+                    // Other matches: dimmer highlight
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    cell_to_style(cell)
+                };
 
                 if cell_style != current_style {
                     if !current_text.is_empty() {
@@ -183,8 +200,8 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
     frame.render_widget(paragraph, inner);
 
     // Show cursor if focused
-    if params.focused && !params.screen.hide_cursor() {
-        let (cursor_row, cursor_col) = params.screen.cursor_position();
+    if params.focused && !screen.hide_cursor() {
+        let (cursor_row, cursor_col) = screen.cursor_position();
         let cursor_x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
         let cursor_y = inner.y + cursor_row.min(inner.height.saturating_sub(1));
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -226,7 +243,10 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Percentage(30)])
         .split(inner);
 
-    // Left side: mode indicator and keybinds
+    // Get focused terminal's search state
+    let search = &app.focused_terminal().search;
+
+    // Left side: mode indicator and keybinds (or search input)
     let (mode_str, mode_style, keybinds) = match app.mode {
         Mode::Insert => (
             " INSERT ",
@@ -241,15 +261,22 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(": Quit  "),
                 Span::styled("s", key_style),
                 Span::raw(": Layout  "),
-                Span::styled("r", key_style),
-                Span::raw(": Resize  "),
-                Span::styled("w", key_style),
-                Span::raw(": Pane  "),
+                Span::styled("/", key_style),
+                Span::raw(": Search  "),
                 Span::styled("j/k", key_style),
-                Span::raw(": Scroll  "),
-                Span::styled("c", key_style),
-                Span::raw(": Clear"),
+                Span::raw(": Scroll"),
             ];
+
+            // Add n/N hint if there are search matches
+            if !search.matches.is_empty() {
+                binds.push(Span::raw("  "));
+                binds.push(Span::styled("n/N", key_style));
+                binds.push(Span::raw(format!(
+                    ": Match {}/{}",
+                    search.current_match + 1,
+                    search.matches.len()
+                )));
+            }
 
             // Add reconnect hint if disconnected
             if !app.connection.is_connected() {
@@ -262,6 +289,46 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 " NORMAL ",
                 Style::default().fg(Color::Black).bg(Color::Blue),
                 binds,
+            )
+        }
+        Mode::Search => {
+            // Show search input with pattern
+            let pattern_style = if search.error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let match_info = if search.matches.is_empty() {
+                if search.pattern.is_empty() {
+                    String::new()
+                } else if search.error {
+                    " (invalid regex)".to_string()
+                } else {
+                    " (no matches)".to_string()
+                }
+            } else {
+                format!(" ({}/{})", search.current_match + 1, search.matches.len())
+            };
+
+            let search_char = match search.direction {
+                SearchDirection::Forward => "/",
+                SearchDirection::Backward => "?",
+            };
+
+            (
+                " SEARCH ",
+                Style::default().fg(Color::Black).bg(Color::Magenta),
+                vec![
+                    Span::raw(search_char),
+                    Span::styled(&search.pattern, pattern_style),
+                    Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+                    Span::raw("  "),
+                    Span::styled("Enter", key_style),
+                    Span::raw(": Confirm  "),
+                    Span::styled("Esc", key_style),
+                    Span::raw(": Cancel"),
+                ],
             )
         }
     };
