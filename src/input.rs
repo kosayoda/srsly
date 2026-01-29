@@ -12,6 +12,8 @@ pub enum KeyAction {
     Quit,
     /// Layout changed, need to recalculate sizes.
     LayoutChanged,
+    /// Reconnect to serial port.
+    Reconnect,
     /// No action needed.
     None,
 }
@@ -25,10 +27,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 }
 
 /// Handle a paste event. Only sends to serial in Insert mode.
-pub fn handle_paste(app: &App, text: &str) -> KeyAction {
+pub fn handle_paste(app: &mut App, text: &str) -> KeyAction {
     match app.mode {
         Mode::Insert => KeyAction::Send(text.as_bytes().into()),
-        Mode::Normal => KeyAction::None,
+        Mode::Normal => {
+            app.show_info("Paste ignored (not in Insert mode)");
+            KeyAction::None
+        }
     }
 }
 
@@ -66,12 +71,15 @@ fn handle_insert_mode(app: &mut App, key: KeyEvent) -> KeyAction {
 
 /// Normal mode: keys are commands.
 fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
-    // Ignore modifiers for normal mode commands
     match key.code {
-        // Mode switching - also focuses app pane
+        // Mode switching - only if connected
         KeyCode::Char('i') => {
-            app.mode = Mode::Insert;
-            app.focus = Focus::App;
+            if app.connection.is_connected() {
+                app.mode = Mode::Insert;
+                app.focus = Focus::App;
+            } else {
+                app.show_error("Cannot enter Insert mode: not connected");
+            }
             KeyAction::None
         }
 
@@ -84,8 +92,16 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
         // Layout toggle
         KeyCode::Char('s') => {
             app.layout = app.layout.toggle();
+            let name = match app.layout {
+                crate::app::Layout::Horizontal => "horizontal",
+                crate::app::Layout::Vertical => "vertical",
+            };
+            app.show_info(format!("Layout: {}", name));
             KeyAction::LayoutChanged
         }
+
+        // Reconnect to serial port (Ctrl+R)
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Reconnect,
 
         // Send resize command
         KeyCode::Char('r') => {
@@ -131,7 +147,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
 
         // Clear focused pane
         KeyCode::Char('c') => {
+            let pane_name = match app.focus {
+                Focus::App => "App",
+                Focus::Kernel => "Kernel",
+            };
             focused_terminal(app).clear();
+            app.show_info(format!("Cleared {} pane", pane_name));
             KeyAction::None
         }
 

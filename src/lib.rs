@@ -28,7 +28,8 @@ pub fn setup() -> Result<()> {
         time::format_description::parse("[hour]:[minute]:[second].[subsecond digits:5]")?;
     let fmt_layer = fmt::layer()
         .compact()
-        .with_timer(fmt::time::UtcTime::new(time_format));
+        .with_timer(fmt::time::UtcTime::new(time_format))
+        .with_writer(std::io::stdout);
 
     tracing_subscriber::registry()
         .with(filter_layer)

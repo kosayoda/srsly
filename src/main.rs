@@ -1,9 +1,10 @@
 use clap::Parser;
+use color_eyre::eyre::bail;
 use color_eyre::Result;
 
 use consolate::app::App;
 use consolate::input::{handle_key, handle_mouse, handle_paste, KeyAction};
-use consolate::serial::{self, SerialConfig};
+use consolate::serial::{self, SerialConfig, SerialWriter};
 use consolate::tui::{Event, TerminalEvent, Tui, TuiConfig};
 use consolate::ui;
 
@@ -26,9 +27,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Serial configuration (kept for reconnection)
+    let serial_config = SerialConfig::new(&args.port, args.baud);
+
     // Open serial port
-    let config = SerialConfig::new(&args.port, args.baud);
-    let (serial_rx, serial_writer) = serial::connect(&config)?;
+    let (serial_rx, serial_writer) = serial::connect(&serial_config)?;
+    let mut serial_writer: Option<SerialWriter> = Some(serial_writer);
 
     // Setup TUI
     let mut tui = Tui::new(TuiConfig::default())?;
@@ -55,32 +59,56 @@ async fn main() -> Result<()> {
             }
             Event::SerialError(e) => {
                 tracing::error!("Serial error: {}", e);
-                let msg = format!("[ERROR] Serial: {}\r\n", e);
-                app.app_terminal.process(msg.as_bytes());
+                app.set_disconnected(e.to_string());
+                serial_writer = None;
             }
             Event::Terminal(term_event) => match term_event {
-                TerminalEvent::Key(key) => match handle_key(&mut app, key) {
-                    KeyAction::Send(bytes) => {
-                        if let Err(e) = serial_writer.send_key(bytes).await {
-                            tracing::error!("Failed to send: {}", e);
+                TerminalEvent::Key(key) => {
+                    // Clear any transient message on key press
+                    app.clear_message();
+
+                    match handle_key(&mut app, key) {
+                        KeyAction::Send(bytes) => {
+                            if let Some(ref writer) = serial_writer {
+                                if let Err(e) = writer.send_key(bytes).await {
+                                    tracing::error!("Failed to send: {}", e);
+                                    app.set_disconnected(e.to_string());
+                                    serial_writer = None;
+                                }
+                            }
                         }
+                        KeyAction::Quit => break,
+                        KeyAction::LayoutChanged => {
+                            let (rows, cols) = ui::pane_inner_size(frame_size, app.layout);
+                            app.resize(rows, cols);
+                        }
+                        KeyAction::Reconnect => match serial::connect(&serial_config) {
+                            Ok((new_rx, new_writer)) => {
+                                tui.restart(new_rx);
+                                serial_writer = Some(new_writer);
+                                app.set_connected();
+                            }
+                            Err(e) => {
+                                tracing::error!("Reconnect failed: {}", e);
+                                app.show_error(format!("Reconnect failed: {}", e));
+                            }
+                        },
+                        KeyAction::None => {}
                     }
-                    KeyAction::Quit => break,
-                    KeyAction::LayoutChanged => {
-                        let (rows, cols) = ui::pane_inner_size(frame_size, app.layout);
-                        app.resize(rows, cols);
-                    }
-                    KeyAction::None => {}
-                },
+                }
                 TerminalEvent::Resize(width, height) => {
                     frame_size = ratatui::layout::Rect::new(0, 0, width, height);
                     let (rows, cols) = ui::pane_inner_size(frame_size, app.layout);
                     app.resize(rows, cols);
                 }
                 TerminalEvent::Paste(text) => {
-                    if let KeyAction::Send(bytes) = handle_paste(&app, &text) {
-                        if let Err(e) = serial_writer.send_key(bytes).await {
-                            tracing::error!("Failed to send paste: {}", e);
+                    if let KeyAction::Send(bytes) = handle_paste(&mut app, &text) {
+                        if let Some(ref writer) = serial_writer {
+                            if let Err(e) = writer.send_key(bytes).await {
+                                tracing::error!("Failed to send paste: {}", e);
+                                app.set_disconnected(e.to_string());
+                                serial_writer = None;
+                            }
                         }
                     }
                 }
@@ -88,7 +116,10 @@ async fn main() -> Result<()> {
                     let layout = ui::UiLayout::compute(frame_size, app.layout);
                     handle_mouse(&mut app, mouse, layout.pane_areas());
                 }
-                TerminalEvent::FocusGained | TerminalEvent::FocusLost | TerminalEvent::Error(_) => {
+                TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
+                TerminalEvent::Error(err) => {
+                    tui.exit()?;
+                    bail!(err);
                 }
             },
         }

@@ -1,30 +1,31 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, HorizontalAlignment, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 
-use crate::app::{App, Focus, Layout as AppLayout, Mode};
+use crate::app::{App, ConnectionState, Focus, Layout as AppLayout, MessageLevel, Mode};
 
 /// Computed layout areas for the UI.
 pub struct UiLayout {
     pub kernel_pane: Rect,
     pub app_pane: Rect,
-    pub keybinds: Rect,
+    pub status_bar: Rect,
 }
 
 impl UiLayout {
     /// Compute layout areas from frame size and layout mode.
     pub fn compute(frame_size: Rect, layout: AppLayout) -> Self {
+        // Bottom area: status bar with top border (2 rows total)
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(frame_size);
 
         let content_area = main_chunks[0];
-        let keybinds = main_chunks[1];
+        let status_bar = main_chunks[1];
 
         let direction = match layout {
             AppLayout::Vertical => Direction::Horizontal,
@@ -39,7 +40,7 @@ impl UiLayout {
         Self {
             kernel_pane: pane_chunks[0],
             app_pane: pane_chunks[1],
-            keybinds,
+            status_bar,
         }
     }
 
@@ -75,8 +76,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.focus == Focus::App,
     );
 
-    // Render keybinds bar
-    render_keybinds(frame, layout.keybinds, app);
+    // Render status bar (with message in frame title if present)
+    render_status_bar(frame, layout.status_bar, app);
 }
 
 /// Render a vt100 terminal pane.
@@ -158,9 +159,31 @@ fn render_terminal_pane(
     }
 }
 
-/// Render the status bar.
-fn render_keybinds(frame: &mut Frame, area: Rect, app: &App) {
+/// Render the status bar (mode, keybinds, connection status).
+/// Message is shown in the frame's top border title.
+fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let (rows, cols) = app.app_terminal.size();
+
+    // Build the frame with message in title
+    let title: Line = match &app.message {
+        Some(message) => {
+            let style = match message.level {
+                MessageLevel::Info => Style::default().fg(Color::Green),
+                MessageLevel::Error => Style::default().fg(Color::Red),
+            };
+            Line::from(Span::styled(format!(" {} ", message.text), style))
+        }
+        None => Line::default(),
+    };
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title_alignment(HorizontalAlignment::Right)
+        .title(title);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     let key_style = Style::default()
         .fg(Color::Cyan)
@@ -170,7 +193,7 @@ fn render_keybinds(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .horizontal_margin(1)
         .constraints([Constraint::Min(0), Constraint::Percentage(30)])
-        .split(area);
+        .split(inner);
 
     // Left side: mode indicator and keybinds
     let (mode_str, mode_style, keybinds) = match app.mode {
@@ -179,12 +202,10 @@ fn render_keybinds(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Black).bg(Color::Green),
             vec![Span::styled("Esc", key_style), Span::raw(": Normal Mode")],
         ),
-        Mode::Normal => (
-            " NORMAL ",
-            Style::default().fg(Color::Black).bg(Color::Blue),
-            vec![
+        Mode::Normal => {
+            let mut binds = vec![
                 Span::styled("i", key_style),
-                Span::raw(": Insert Mode  "),
+                Span::raw(": Insert  "),
                 Span::styled("q", key_style),
                 Span::raw(": Quit  "),
                 Span::styled("s", key_style),
@@ -192,24 +213,48 @@ fn render_keybinds(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("r", key_style),
                 Span::raw(": Resize  "),
                 Span::styled("w", key_style),
-                Span::raw(": Switch pane  "),
+                Span::raw(": Pane  "),
                 Span::styled("j/k", key_style),
                 Span::raw(": Scroll  "),
                 Span::styled("c", key_style),
                 Span::raw(": Clear"),
-            ],
-        ),
+            ];
+
+            // Add reconnect hint if disconnected
+            if !app.connection.is_connected() {
+                binds.push(Span::raw("  "));
+                binds.push(Span::styled("^R", key_style));
+                binds.push(Span::raw(": Reconnect"));
+            }
+
+            (
+                " NORMAL ",
+                Style::default().fg(Color::Black).bg(Color::Blue),
+                binds,
+            )
+        }
     };
 
     let mut left_spans = vec![Span::styled(mode_str, mode_style), Span::raw(" ")];
     left_spans.extend(keybinds);
     let left = Paragraph::new(Line::from(left_spans));
 
-    // Right side: terminal size
-    let right = Paragraph::new(Line::from(vec![Span::styled(
-        format!("{}x{}", cols, rows),
-        Style::default().fg(Color::Yellow),
-    )]))
+    // Right side: connection indicator + terminal size
+    let conn_indicator = match &app.connection {
+        ConnectionState::Connected => Span::styled(" ", Style::default().fg(Color::Green)),
+        ConnectionState::Disconnected { .. } => Span::styled(" ", Style::default().fg(Color::Red)),
+    };
+
+    let size_style = match &app.connection {
+        ConnectionState::Connected => Style::default().fg(Color::Yellow),
+        ConnectionState::Disconnected { .. } => Style::default().fg(Color::DarkGray),
+    };
+
+    let right = Paragraph::new(Line::from(vec![
+        conn_indicator,
+        Span::raw(" "),
+        Span::styled(format!("{}x{}", cols, rows), size_style),
+    ]))
     .alignment(ratatui::layout::Alignment::Right);
 
     frame.render_widget(left, chunks[0]);

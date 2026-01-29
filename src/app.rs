@@ -13,6 +13,22 @@ pub enum Mode {
     Normal,
 }
 
+/// Serial connection state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectionState {
+    #[default]
+    Connected,
+    Disconnected {
+        error: String,
+    },
+}
+
+impl ConnectionState {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, ConnectionState::Connected)
+    }
+}
+
 /// Which pane currently has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -56,6 +72,24 @@ pub struct App {
     pub layout: Layout,
     /// Whether the app should quit.
     pub should_quit: bool,
+    /// Serial connection state.
+    pub connection: ConnectionState,
+    /// Transient message to display in the message bar.
+    pub message: Option<Message>,
+}
+
+/// A transient message to display in the UI.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub text: String,
+    pub level: MessageLevel,
+}
+
+/// Message severity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageLevel {
+    Info,
+    Error,
 }
 
 impl App {
@@ -67,7 +101,45 @@ impl App {
             focus: Focus::App,
             layout: Layout::default(),
             should_quit: false,
+            connection: ConnectionState::default(),
+            message: None,
         }
+    }
+
+    /// Mark connection as disconnected with an error message.
+    pub fn set_disconnected(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        self.show_error(format!("Serial disconnected: {}", error));
+        self.connection = ConnectionState::Disconnected { error };
+        // Switch to Normal mode so user can press Ctrl+R to reconnect
+        self.mode = Mode::Normal;
+    }
+
+    /// Mark connection as connected.
+    pub fn set_connected(&mut self) {
+        self.connection = ConnectionState::Connected;
+        self.show_info("Serial reconnected");
+    }
+
+    /// Show an info message.
+    pub fn show_info(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            level: MessageLevel::Info,
+        });
+    }
+
+    /// Show an error message.
+    pub fn show_error(&mut self, text: impl Into<String>) {
+        self.message = Some(Message {
+            text: text.into(),
+            level: MessageLevel::Error,
+        });
+    }
+
+    /// Clear the current message.
+    pub fn clear_message(&mut self) {
+        self.message = None;
     }
 
     /// Resize both terminal panes.

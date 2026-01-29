@@ -258,6 +258,12 @@ impl Tui {
         self.cancellation_token.cancel();
     }
 
+    /// Restart the event loop with a new serial connection.
+    /// This cancels the current task and starts a new one.
+    pub fn restart(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
+        self.start(serial_rx);
+    }
+
     pub async fn next(&mut self) -> Option<Event> {
         self.event_rx.recv().await
     }
