@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use dialoguer::Select;
+use dialoguer::theme::ColorfulTheme;
 use owo_colors::OwoColorize;
 
 use srsly::app::App;
@@ -14,18 +16,18 @@ use srsly::ui;
 #[command(name = "srsly", version, about)]
 struct Args {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List available serial ports
     List,
-    /// Connect to a serial port (default)
+    /// Connect to a serial port
     Connect {
-        /// Serial port device path
+        /// Serial port device path (interactive selection if not provided)
         #[arg(short, long)]
-        port: String,
+        port: Option<String>,
 
         /// Baud rate
         #[arg(short, long, default_value_t = 115200)]
@@ -40,16 +42,60 @@ async fn main() -> Result<()> {
     let Args { command } = Args::parse();
 
     match command {
-        Command::List => {
+        Some(Command::List) => {
             list_ports();
-            return Ok(());
         }
-        Command::Connect { port, baud } => {
+        Some(Command::Connect { port, baud }) => {
+            let port = match port {
+                Some(p) => p,
+                None => select_port()?,
+            };
             run_connect(&port, baud).await?;
+        }
+        None => {
+            let port = select_port()?;
+            run_connect(&port, 115200).await?;
         }
     }
 
     Ok(())
+}
+
+fn select_port() -> Result<String> {
+    let ports = tokio_serial::available_ports()?;
+
+    if ports.is_empty() {
+        bail!("No serial ports found");
+    }
+
+    let items: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let name = &p.port_name;
+            match &p.port_type {
+                tokio_serial::SerialPortType::UsbPort(info) => {
+                    let product = info.product.as_deref().unwrap_or("Unknown");
+                    let manufacturer = info.manufacturer.as_deref().unwrap_or("Unknown");
+                    format!("{} - {} [{}]", name, product, manufacturer)
+                }
+                tokio_serial::SerialPortType::BluetoothPort => {
+                    format!("{} - Bluetooth", name)
+                }
+                tokio_serial::SerialPortType::PciPort => {
+                    format!("{} - PCI", name)
+                }
+                tokio_serial::SerialPortType::Unknown => name.clone(),
+            }
+        })
+        .collect();
+
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select a serial port")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    Ok(ports[selection].port_name.clone())
 }
 
 fn list_ports() {
