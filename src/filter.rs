@@ -19,6 +19,8 @@ pub struct KernelFilter {
     pending_line: Vec<u8>,
     /// When the pending line started accumulating.
     pending_since: Option<Instant>,
+    /// True if the last byte was ESC (0x1b), to skip `[` in escape sequences.
+    last_was_esc: bool,
 }
 
 impl KernelFilter {
@@ -28,6 +30,7 @@ impl KernelFilter {
             kernel_pattern: Regex::new(r"^\[\s*\d+\.\d+\]").expect("invalid kernel regex"),
             pending_line: Vec::new(),
             pending_since: None,
+            last_was_esc: false,
         }
     }
 
@@ -65,15 +68,19 @@ impl KernelFilter {
                     app_data.extend_from_slice(&line);
                 }
             }
+            self.last_was_esc = false;
         } else {
             // Not currently buffering
-            if byte == b'[' {
+            // Only buffer `[` if it's not part of an ANSI escape sequence (\x1b[)
+            if byte == b'[' && !self.last_was_esc {
                 // Start of potential kernel message - begin buffering
                 self.pending_line.push(byte);
                 self.pending_since = Some(Instant::now());
+                self.last_was_esc = false;
             } else {
                 // Regular byte - pass through immediately
                 app_data.push(byte);
+                self.last_was_esc = byte == 0x1b;
             }
         }
     }
