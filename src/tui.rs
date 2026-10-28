@@ -13,7 +13,7 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend as Backend;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -73,8 +73,13 @@ impl Default for TuiConfig {
 pub struct Tui {
     terminal: ratatui::Terminal<Backend<std::io::Stdout>>,
 
-    task: JoinHandle<()>,
-    cancellation_token: CancellationToken,
+    /// Reads serial data and drives timers. Runs until reconnect or exit.
+    serial_task: JoinHandle<()>,
+    serial_token: CancellationToken,
+
+    /// Reads terminal input. Paused while an external program has the terminal.
+    input_task: JoinHandle<()>,
+    input_token: CancellationToken,
 
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
@@ -94,12 +99,12 @@ impl Tui {
         let (event_tx, event_rx) = mpsc::channel(1024);
         let (no_response_tx, _no_response_rx) = mpsc::channel(16);
         let (autoscroll_tx, _autoscroll_rx) = mpsc::channel(16);
-        let cancellation_token = CancellationToken::new();
-        let task = tokio::spawn(async {});
         Ok(Self {
             terminal,
-            task,
-            cancellation_token,
+            serial_task: tokio::spawn(async {}),
+            serial_token: CancellationToken::new(),
+            input_task: tokio::spawn(async {}),
+            input_token: CancellationToken::new(),
             event_rx,
             event_tx,
             no_response_tx,
@@ -118,49 +123,40 @@ impl Tui {
         let _ = self.autoscroll_tx.try_send(enabled);
     }
 
-    fn start(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
-        // Cancel existing task
-        self.cancel();
-        self.cancellation_token = CancellationToken::new();
+    fn start_serial(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
+        self.serial_token.cancel();
+        self.serial_token = CancellationToken::new();
 
-        // Create new channel for no-response deadline
         let (no_response_tx, no_response_rx) = mpsc::channel(16);
         self.no_response_tx = no_response_tx;
         let (autoscroll_tx, autoscroll_rx) = mpsc::channel(16);
         self.autoscroll_tx = autoscroll_tx;
 
-        // Get task dependencies
-        let _event_tx = self.event_tx.clone();
-        let _cancellation_token = self.cancellation_token.clone();
+        let event_tx = self.event_tx.clone();
+        let token = self.serial_token.clone();
 
-        self.task = tokio::spawn(async move {
-            let mut reader = crossterm::event::EventStream::new();
+        self.serial_task = tokio::spawn(async move {
             let mut serial = tokio_stream::wrappers::ReceiverStream::new(serial_rx);
             let mut no_response_updates =
                 tokio_stream::wrappers::ReceiverStream::new(no_response_rx);
+            let mut autoscroll_updates = tokio_stream::wrappers::ReceiverStream::new(autoscroll_rx);
             let mut filter = KernelFilter::new();
             let mut no_response_deadline: Option<tokio::time::Instant> = None;
-            let mut autoscroll_updates = tokio_stream::wrappers::ReceiverStream::new(autoscroll_rx);
             let mut autoscroll = false;
 
             macro_rules! try_send {
-                ($event_tx:ident, $event:expr) => {
-                    if $event_tx.send($event).await.is_err() {
+                ($event:expr) => {
+                    if event_tx.send($event).await.is_err() {
                         break;
                     }
                 };
             }
 
-            if _event_tx.send(Event::Init).await.is_err() {
+            if event_tx.send(Event::Init).await.is_err() {
                 return;
             }
 
             loop {
-                let crossterm_event = reader.next().fuse();
-                let serial_event = serial.next().fuse();
-                let deadline_update = no_response_updates.next().fuse();
-                let autoscroll_update = autoscroll_updates.next().fuse();
-
                 // Dynamic timeout based on pending kernel line
                 let flush_deadline = filter.next_deadline();
                 let flush_timeout = async {
@@ -187,88 +183,83 @@ impl Tui {
                 };
 
                 tokio::select! {
-                    _ = _cancellation_token.cancelled() => {
+                    _ = token.cancelled() => {
                         tracing::debug!("Received cancellation notice, exiting");
                         break;
                     }
-                    new_deadline = deadline_update => {
-                        // Update the no-response deadline
-                        if let Some(deadline) = new_deadline {
-                            no_response_deadline = deadline;
-                        }
+                    Some(deadline) = no_response_updates.next() => {
+                        no_response_deadline = deadline;
                     }
-                    enabled = autoscroll_update => {
-                        if let Some(enabled) = enabled {
-                            autoscroll = enabled;
-                        }
+                    Some(enabled) = autoscroll_updates.next() => {
+                        autoscroll = enabled;
                     }
                     _ = autoscroll_tick => {
-                        try_send!(_event_tx, Event::AutoscrollTick);
+                        try_send!(Event::AutoscrollTick);
                     }
                     _ = no_response_timeout => {
-                        // "No response" timeout reached
                         no_response_deadline = None;
-                        try_send!(_event_tx, Event::NoResponseTimeout);
+                        try_send!(Event::NoResponseTimeout);
                     }
-                    maybe_serial = serial_event => {
+                    // Disabled once the serial stream ends after a disconnect
+                    Some(event) = serial.next() => {
                         use crate::serial::SerialEvent;
-                        let Some(event) = maybe_serial else {
-                            continue;
-                        };
                         match event {
                             SerialEvent::Data(data) => {
                                 let (app_data, kernel_data) = filter.process(&data);
                                 if !app_data.is_empty() {
-                                    try_send!(_event_tx, Event::AppData(app_data));
+                                    try_send!(Event::AppData(app_data));
                                 }
                                 if !kernel_data.is_empty() {
-                                    try_send!(_event_tx, Event::KernelData(kernel_data));
+                                    try_send!(Event::KernelData(kernel_data));
                                 }
                             }
                             SerialEvent::Error(e) => {
-                                try_send!(_event_tx, Event::SerialError(e));
+                                try_send!(Event::SerialError(e));
                             }
                         }
                     }
-                    maybe_event = crossterm_event => {
-                        let Some(event) = maybe_event else {
-                            continue;
-                        };
-                        match event {
-                            Ok(evt) => match evt {
-                                CrosstermEvent::Key(key) => {
-                                    if key.kind == KeyEventKind::Press {
-                                        try_send!(_event_tx, TerminalEvent::Key(key).into())
-                                    }
-                                },
-                                CrosstermEvent::Mouse(mouse) => {
-                                    try_send!(_event_tx, TerminalEvent::Mouse(mouse).into())
-                                },
-                                CrosstermEvent::Resize(x, y) => {
-                                    try_send!(_event_tx, TerminalEvent::Resize(x, y).into())
-                                },
-                                CrosstermEvent::FocusLost => {
-                                    try_send!(_event_tx, TerminalEvent::FocusLost.into())
-                                },
-                                CrosstermEvent::FocusGained => {
-                                    try_send!(_event_tx, TerminalEvent::FocusGained.into())
-                                },
-                                CrosstermEvent::Paste(s) => {
-                                    try_send!(_event_tx, TerminalEvent::Paste(s).into())
-                                },
-                            },
-                            Err(e) => {
-                                try_send!(_event_tx, TerminalEvent::Error(e.kind()).into())
-                            }
-                        }
-                    },
                     _ = flush_timeout => {
                         // Pending line timed out - flush to app terminal
                         let data = filter.flush_pending();
                         if !data.is_empty() {
-                            try_send!(_event_tx, Event::AppData(data));
+                            try_send!(Event::AppData(data));
                         }
-                    },
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_input(&mut self) {
+        self.input_token.cancel();
+        self.input_token = CancellationToken::new();
+
+        let event_tx = self.event_tx.clone();
+        let token = self.input_token.clone();
+
+        self.input_task = tokio::spawn(async move {
+            let mut reader = crossterm::event::EventStream::new();
+
+            loop {
+                let event = tokio::select! {
+                    _ = token.cancelled() => break,
+                    event = reader.next() => event,
+                };
+                let event = match event {
+                    Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
+                        TerminalEvent::Key(key)
+                    }
+                    Some(Ok(CrosstermEvent::Key(_))) => continue,
+                    Some(Ok(CrosstermEvent::Mouse(mouse))) => TerminalEvent::Mouse(mouse),
+                    Some(Ok(CrosstermEvent::Resize(x, y))) => TerminalEvent::Resize(x, y),
+                    Some(Ok(CrosstermEvent::FocusLost)) => TerminalEvent::FocusLost,
+                    Some(Ok(CrosstermEvent::FocusGained)) => TerminalEvent::FocusGained,
+                    Some(Ok(CrosstermEvent::Paste(s))) => TerminalEvent::Paste(s),
+                    Some(Err(e)) => TerminalEvent::Error(e.kind()),
+                    None => break,
+                };
+                if event_tx.send(event.into()).await.is_err() {
+                    break;
                 }
             }
         });
@@ -278,22 +269,48 @@ impl Tui {
         self.cancel();
         std::thread::sleep(Duration::from_millis(50));
 
-        if self.task.is_finished() {
+        let finished = |tui: &Self| tui.serial_task.is_finished() && tui.input_task.is_finished();
+        if finished(self) {
             return Ok(());
         }
 
-        self.task.abort();
+        self.serial_task.abort();
+        self.input_task.abort();
         std::thread::sleep(Duration::from_millis(50));
 
-        ensure!(
-            self.task.is_finished(),
-            "Failed to abort task in 100 milliseconds"
-        );
+        ensure!(finished(self), "Failed to abort tasks in 100 milliseconds");
 
         Ok(())
     }
 
     pub fn enter(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) -> Result<()> {
+        self.setup_terminal()?;
+        self.start_serial(serial_rx);
+        self.start_input();
+        Ok(())
+    }
+
+    pub fn exit(&mut self) -> Result<()> {
+        self.stop()?;
+        self.restore_terminal()
+    }
+
+    /// Hand the terminal to another program. Serial data keeps flowing.
+    pub async fn suspend(&mut self) -> Result<()> {
+        self.input_token.cancel();
+        (&mut self.input_task).await.ok();
+        self.restore_terminal()
+    }
+
+    /// Take the terminal back after [`Tui::suspend`].
+    pub fn resume(&mut self) -> Result<()> {
+        self.setup_terminal()?;
+        self.start_input();
+        self.terminal.clear()?;
+        Ok(())
+    }
+
+    fn setup_terminal(&mut self) -> Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), EnterAlternateScreen, cursor::Hide)?;
 
@@ -304,14 +321,10 @@ impl Tui {
         if self.config.enable_paste {
             crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
         }
-
-        self.start(serial_rx);
         Ok(())
     }
 
-    pub fn exit(&mut self) -> Result<()> {
-        self.stop()?;
-
+    fn restore_terminal(&mut self) -> Result<()> {
         if crossterm::terminal::is_raw_mode_enabled()? {
             self.flush()?;
 
@@ -330,13 +343,13 @@ impl Tui {
     }
 
     pub fn cancel(&self) {
-        self.cancellation_token.cancel();
+        self.serial_token.cancel();
+        self.input_token.cancel();
     }
 
-    /// Restart the event loop with a new serial connection.
-    /// This cancels the current task and starts a new one.
+    /// Restart serial reading with a new connection.
     pub fn restart(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
-        self.start(serial_rx);
+        self.start_serial(serial_rx);
     }
 
     pub async fn next(&mut self) -> Option<Event> {

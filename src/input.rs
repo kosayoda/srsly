@@ -23,6 +23,8 @@ pub enum KeyAction {
     SearchChanged,
     /// Copy text to the clipboard.
     Copy(String),
+    /// Open the focused pane's scrollback in a pager.
+    OpenPager,
     /// No action needed.
     None,
 }
@@ -190,6 +192,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
             focused_terminal(app).scroll_to_bottom();
             KeyAction::None
         }
+
+        KeyCode::Char('o') => KeyAction::OpenPager,
 
         // Clear focused pane
         KeyCode::Char('c') => {

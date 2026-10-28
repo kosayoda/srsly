@@ -267,6 +267,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(": Search  "),
                 Span::styled("v", key_style),
                 Span::raw(": Select  "),
+                Span::styled("o", key_style),
+                Span::raw(": Pager  "),
                 Span::styled("j/k", key_style),
                 Span::raw(": Scroll"),
             ];

@@ -602,6 +602,16 @@ impl Terminal {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    /// The whole buffer with colors as VT sequences and soft-wrapped lines
+    /// joined.
+    pub fn export(&self) -> Result<Vec<u8>, Error> {
+        let opts = FormatterOptions::new()
+            .with_format(Format::Vt)
+            .with_unwrap(true)
+            .with_trim(true);
+        Ok(Formatter::new(&self.vt, opts)?.format_alloc(None)?.to_vec())
+    }
+
     /// Snapshot the visible rows for rendering.
     pub fn viewport(&mut self) -> Viewport {
         self.try_viewport().unwrap_or_else(|e| {

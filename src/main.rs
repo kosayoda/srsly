@@ -5,7 +5,7 @@ use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 use owo_colors::OwoColorize;
 
-use srsly::app::App;
+use srsly::app::{App, Focus};
 use srsly::clipboard;
 use srsly::input::{KeyAction, handle_key, handle_mouse, handle_paste};
 use srsly::serial::{self, SerialConfig, SerialWriter};
@@ -175,8 +175,33 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
         }
     };
 
+    let mut pager: Option<Pager> = None;
+
     // Main event loop
-    while let Some(event) = tui.next().await {
+    loop {
+        let event = tokio::select! {
+            event = tui.next() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            status = wait_pager(&mut pager) => {
+                if let Some(Pager { path, .. }) = pager.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+                tui.resume()?;
+                if let Err(e) = status {
+                    app.show_error(format!("Pager failed: {e}"));
+                }
+                // The terminal may have been resized while the pager had it
+                let size = tui.size()?;
+                frame_size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                let (rows, cols) = ui::pane_inner_size(frame_size, app.layout);
+                app.resize(rows, cols);
+                tui.draw(|frame| ui::render(frame, &mut app))?;
+                continue;
+            }
+        };
+
         match event {
             Event::Init | Event::NoResponseTimeout => {
                 // NoResponseTimeout just triggers a redraw (handled below)
@@ -240,6 +265,13 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
                             app.focused_terminal_mut().update_search_matches();
                         }
                         KeyAction::Copy(text) => copy(&mut app, &text),
+                        KeyAction::OpenPager => match open_pager(&app, &mut tui).await {
+                            Ok(p) => pager = Some(p),
+                            Err(e) => {
+                                tui.resume()?;
+                                app.show_error(format!("Pager failed: {e}"));
+                            }
+                        },
                         KeyAction::None => {}
                     }
                 }
@@ -277,10 +309,50 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
             },
         }
 
-        tui.draw(|frame| ui::render(frame, &mut app))?;
+        if pager.is_none() {
+            tui.draw(|frame| ui::render(frame, &mut app))?;
+        }
     }
 
     Ok(())
+}
+
+/// A pager showing an exported pane, and the temp file it reads.
+struct Pager {
+    child: tokio::process::Child,
+    path: std::path::PathBuf,
+}
+
+/// Export the focused pane and open it in `$PAGER` (default `less -R`).
+/// The TUI is suspended; the caller must resume it if this fails.
+async fn open_pager(app: &App, tui: &mut Tui) -> Result<Pager> {
+    let name = match app.focus {
+        Focus::App => "app",
+        Focus::Kernel => "kernel",
+    };
+    let path = std::env::temp_dir().join(format!("srsly-{}-{name}.txt", std::process::id()));
+    std::fs::write(&path, app.focused_terminal().export()?)?;
+
+    tui.suspend().await?;
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", r#"${PAGER:-less -R} "$1""#, "sh"])
+        .arg(&path)
+        .spawn()?;
+    Ok(Pager { child, path })
+}
+
+/// Wait for the pager to exit. Pends forever when no pager is open.
+async fn wait_pager(pager: &mut Option<Pager>) -> std::io::Result<std::process::ExitStatus> {
+    let Some(pager) = pager else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::select! {
+            status = pager.child.wait() => return status,
+            // The pager handles Ctrl-C itself; don't let it kill srsly
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
 }
 
 fn copy(app: &mut App, text: &str) {
