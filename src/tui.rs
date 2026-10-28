@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::filter::KernelFilter;
 
+/// Time between autoscroll steps while dragging past a pane edge.
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub enum Event {
     Init,
@@ -32,6 +35,8 @@ pub enum Event {
     SerialError(std::io::Error),
     /// "No response" timeout reached - trigger UI refresh.
     NoResponseTimeout,
+    /// A mouse drag is past a pane edge; scroll and extend the selection.
+    AutoscrollTick,
 }
 
 impl From<TerminalEvent> for Event {
@@ -77,6 +82,9 @@ pub struct Tui {
     /// Channel to send "no response" deadline updates to the event loop.
     no_response_tx: mpsc::Sender<Option<tokio::time::Instant>>,
 
+    /// Channel to turn autoscroll ticks on and off.
+    autoscroll_tx: mpsc::Sender<bool>,
+
     config: TuiConfig,
 }
 
@@ -85,6 +93,7 @@ impl Tui {
         let terminal = ratatui::Terminal::new(Backend::new(std::io::stdout()))?;
         let (event_tx, event_rx) = mpsc::channel(1024);
         let (no_response_tx, _no_response_rx) = mpsc::channel(16);
+        let (autoscroll_tx, _autoscroll_rx) = mpsc::channel(16);
         let cancellation_token = CancellationToken::new();
         let task = tokio::spawn(async {});
         Ok(Self {
@@ -94,6 +103,7 @@ impl Tui {
             event_rx,
             event_tx,
             no_response_tx,
+            autoscroll_tx,
             config,
         })
     }
@@ -101,6 +111,11 @@ impl Tui {
     /// Set the deadline for "no response" timeout. Pass None to cancel.
     pub fn set_no_response_deadline(&self, deadline: Option<tokio::time::Instant>) {
         let _ = self.no_response_tx.try_send(deadline);
+    }
+
+    /// Enable or disable periodic [`Event::AutoscrollTick`] events.
+    pub fn set_autoscroll(&self, enabled: bool) {
+        let _ = self.autoscroll_tx.try_send(enabled);
     }
 
     fn start(&mut self, serial_rx: mpsc::Receiver<crate::serial::SerialEvent>) {
@@ -111,6 +126,8 @@ impl Tui {
         // Create new channel for no-response deadline
         let (no_response_tx, no_response_rx) = mpsc::channel(16);
         self.no_response_tx = no_response_tx;
+        let (autoscroll_tx, autoscroll_rx) = mpsc::channel(16);
+        self.autoscroll_tx = autoscroll_tx;
 
         // Get task dependencies
         let _event_tx = self.event_tx.clone();
@@ -123,6 +140,8 @@ impl Tui {
                 tokio_stream::wrappers::ReceiverStream::new(no_response_rx);
             let mut filter = KernelFilter::new();
             let mut no_response_deadline: Option<tokio::time::Instant> = None;
+            let mut autoscroll_updates = tokio_stream::wrappers::ReceiverStream::new(autoscroll_rx);
+            let mut autoscroll = false;
 
             macro_rules! try_send {
                 ($event_tx:ident, $event:expr) => {
@@ -140,6 +159,7 @@ impl Tui {
                 let crossterm_event = reader.next().fuse();
                 let serial_event = serial.next().fuse();
                 let deadline_update = no_response_updates.next().fuse();
+                let autoscroll_update = autoscroll_updates.next().fuse();
 
                 // Dynamic timeout based on pending kernel line
                 let flush_deadline = filter.next_deadline();
@@ -158,6 +178,14 @@ impl Tui {
                     }
                 };
 
+                let autoscroll_tick = async {
+                    if autoscroll {
+                        tokio::time::sleep(AUTOSCROLL_INTERVAL).await
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+
                 tokio::select! {
                     _ = _cancellation_token.cancelled() => {
                         tracing::debug!("Received cancellation notice, exiting");
@@ -168,6 +196,14 @@ impl Tui {
                         if let Some(deadline) = new_deadline {
                             no_response_deadline = deadline;
                         }
+                    }
+                    enabled = autoscroll_update => {
+                        if let Some(enabled) = enabled {
+                            autoscroll = enabled;
+                        }
+                    }
+                    _ = autoscroll_tick => {
+                        try_send!(_event_tx, Event::AutoscrollTick);
                     }
                     _ = no_response_timeout => {
                         // "No response" timeout reached

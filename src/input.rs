@@ -1,9 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
 use smallvec::{SmallVec, smallvec};
 
 use crate::app::{App, Focus, Mode};
 use crate::terminal::SearchDirection;
+use crate::ui::{UiLayout, pane_inner};
+
+/// Lines scrolled per mouse wheel step.
+const WHEEL_LINES: usize = 3;
 
 /// Result of handling a key event.
 pub enum KeyAction {
@@ -17,6 +20,8 @@ pub enum KeyAction {
     Reconnect,
     /// Search pattern changed, need to update matches.
     SearchChanged,
+    /// Copy text to the clipboard.
+    Copy(String),
     /// No action needed.
     None,
 }
@@ -41,20 +46,52 @@ pub fn handle_paste(app: &mut App, text: &str) -> KeyAction {
     }
 }
 
-/// Handle a mouse event. Click to focus a pane.
-/// `pane_areas` should be (kernel_area, app_area).
-pub fn handle_mouse(app: &mut App, mouse: MouseEvent, pane_areas: (Rect, Rect)) -> KeyAction {
-    let (kernel_area, app_area) = pane_areas;
+/// Handle a mouse event: click to focus, drag to select, wheel to scroll.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: &UiLayout) -> KeyAction {
+    let (x, y) = (mouse.column, mouse.row);
 
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        let x = mouse.column;
-        let y = mouse.row;
-
-        if kernel_area.contains((x, y).into()) {
-            app.focus = Focus::Kernel;
-        } else if app_area.contains((x, y).into()) {
-            app.focus = Focus::App;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(pane) = layout.pane_at(x, y) else {
+                return KeyAction::None;
+            };
+            app.focus = pane;
+            for other in [Focus::App, Focus::Kernel] {
+                app.terminal_mut(other).clear_selection();
+            }
+            let inner = pane_inner(layout.pane(pane));
+            if inner.contains((x, y).into()) {
+                app.dragging = Some(pane);
+                let time = app.elapsed();
+                app.terminal_mut(pane)
+                    .mouse_press(x - inner.x, y - inner.y, time);
+            }
         }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(pane) = app.dragging {
+                let inner = pane_inner(layout.pane(pane));
+                app.terminal_mut(pane)
+                    .mouse_drag(x as i32 - inner.x as i32, y as i32 - inner.y as i32);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(pane) = app.dragging.take()
+                && let Some(text) = app.terminal_mut(pane).mouse_release()
+            {
+                return KeyAction::Copy(text);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if let Some(pane) = layout.pane_at(x, y) {
+                app.terminal_mut(pane).scroll_up(WHEEL_LINES);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some(pane) = layout.pane_at(x, y) {
+                app.terminal_mut(pane).scroll_down(WHEEL_LINES);
+            }
+        }
+        _ => {}
     }
 
     KeyAction::None
@@ -190,9 +227,11 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
             KeyAction::None
         }
 
-        // Clear search highlights
+        // Clear search highlights and selection
         KeyCode::Esc => {
-            focused_terminal(app).search.clear();
+            let terminal = focused_terminal(app);
+            terminal.search.clear();
+            terminal.clear_selection();
             KeyAction::None
         }
 

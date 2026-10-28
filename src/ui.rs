@@ -54,10 +54,32 @@ impl UiLayout {
         }
     }
 
-    /// Get pane areas as tuple (kernel, app) for hit testing.
-    pub fn pane_areas(&self) -> (Rect, Rect) {
-        (self.kernel_pane, self.app_pane)
+    /// Outer area of a pane, including its border.
+    pub fn pane(&self, pane: Focus) -> Rect {
+        match pane {
+            Focus::Kernel => self.kernel_pane,
+            Focus::App => self.app_pane,
+        }
     }
+
+    /// Pane under a screen position.
+    pub fn pane_at(&self, x: u16, y: u16) -> Option<Focus> {
+        [Focus::Kernel, Focus::App]
+            .into_iter()
+            .find(|&p| self.pane(p).contains((x, y).into()))
+    }
+}
+
+/// Border and padding shared by both panes.
+fn pane_block<'a>() -> Block<'a> {
+    Block::default()
+        .padding(Padding::horizontal(1))
+        .borders(Borders::ALL)
+}
+
+/// Area inside a pane's border where terminal cells are drawn.
+pub fn pane_inner(area: Rect) -> Rect {
+    pane_block().inner(area)
 }
 
 /// Render the application UI.
@@ -123,11 +145,7 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
         Line::from(format!(" {} ({}) ", params.title, title_suffix))
     };
 
-    let block = Block::default()
-        .padding(Padding::horizontal(1))
-        .title(title_line)
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = pane_block().title(title_line).border_style(border_style);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -389,13 +407,7 @@ fn color_to_ratatui(color: StyleColor) -> Color {
 /// Calculate the inner pane size after accounting for borders and padding.
 /// Returns (rows, cols) for terminal emulators.
 pub fn pane_inner_size(frame_size: Rect, layout: AppLayout) -> (u16, u16) {
-    let ui_layout = UiLayout::compute(frame_size, layout);
-    // Use app_pane dimensions (same as kernel_pane with 50/50 split)
-    let pane = ui_layout.app_pane;
-
-    // Account for border (2) and horizontal padding (2)
-    let inner_rows = pane.height.saturating_sub(2);
-    let inner_cols = pane.width.saturating_sub(4);
-
-    (inner_rows, inner_cols)
+    // Both panes get the same size from the 50/50 split
+    let inner = pane_inner(UiLayout::compute(frame_size, layout).app_pane);
+    (inner.height, inner.width)
 }

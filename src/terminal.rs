@@ -1,16 +1,31 @@
+use std::time::Duration;
+
 use libghostty_vt::{
-    Terminal as Vt, TerminalOptions,
+    TerminalOptions,
     error::Error,
     fmt::{Format, Formatter, FormatterOptions},
     render::{CellIterator, RenderState, RowIterator},
-    screen::{CellContentTag, CellWide, TrackedGridRef},
+    screen::{CellContentTag, CellWide, GridRef, TrackedGridRef},
+    selection::{
+        Selection,
+        gesture::{
+            Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
+        },
+    },
     style::{Style, StyleColor},
     terminal::{Point, PointCoordinate, PointSpace, ScrollViewport},
 };
 
+/// Gesture positions are in "pixels"; each cell is this many on a side.
+const CELL_PX: u32 = 10;
+/// Maximum time between clicks for double/triple click.
+const REPEAT_INTERVAL: Duration = Duration::from_millis(400);
+
+type Vt = libghostty_vt::Terminal<'static, 'static>;
+
 /// A scrollable terminal backed by libghostty-vt.
 pub struct Terminal {
-    vt: Vt<'static, 'static>,
+    vt: Vt,
     render: RenderState<'static>,
     row_iter: RowIterator<'static>,
     cell_iter: CellIterator<'static>,
@@ -21,6 +36,21 @@ pub struct Terminal {
     search_anchor: Option<(TrackedGridRef, u32)>,
     /// New output arrived since matches were computed.
     search_stale: bool,
+    mouse: Mouse,
+    /// Tracked endpoints of the active selection.
+    selection: Option<(TrackedGridRef, TrackedGridRef)>,
+}
+
+/// Selection gesture state and reusable event objects.
+struct Mouse {
+    gesture: Gesture<'static>,
+    press: PressEvent<'static>,
+    drag: DragEvent<'static>,
+    release: ReleaseEvent<'static>,
+    tick: AutoscrollTickEvent<'static>,
+    /// Last pointer position in cells, relative to the viewport. May be
+    /// outside it while dragging.
+    pointer: (i32, i32),
 }
 
 /// Search direction (vim-style).
@@ -186,7 +216,7 @@ impl Terminal {
     /// Create a new terminal with the given dimensions.
     pub fn new(rows: u16, cols: u16, scrollback_bytes: usize) -> Result<Self, Error> {
         Ok(Self {
-            vt: Vt::new(TerminalOptions {
+            vt: libghostty_vt::Terminal::new(TerminalOptions {
                 cols: cols.max(1),
                 rows: rows.max(1),
                 max_scrollback: scrollback_bytes,
@@ -197,6 +227,15 @@ impl Terminal {
             search: SearchState::default(),
             search_anchor: None,
             search_stale: false,
+            mouse: Mouse {
+                gesture: Gesture::new()?,
+                press: PressEvent::new()?,
+                drag: DragEvent::new()?,
+                release: ReleaseEvent::new()?,
+                tick: AutoscrollTickEvent::new()?,
+                pointer: (0, 0),
+            },
+            selection: None,
         })
     }
 
@@ -267,6 +306,143 @@ impl Terminal {
         self.search.matches.clear();
         self.search.current_match = 0;
         self.search_anchor = None;
+    }
+
+    /// Start a selection gesture at a viewport cell. `time` is a monotonic
+    /// timestamp used to detect double and triple clicks.
+    pub fn mouse_press(&mut self, col: u16, row: u16, time: Duration) {
+        self.mouse.pointer = (col as i32, row as i32);
+        let (x, y) = cell_center(self.mouse.pointer);
+        let result = (|| {
+            let grid = viewport_ref(&self.vt, self.mouse.pointer)?;
+            let selection = self
+                .mouse
+                .press
+                .set_position(x, y)?
+                .set_time(time)?
+                .set_repeat_interval(REPEAT_INTERVAL)?
+                .set_repeat_distance(CELL_PX as f64)?
+                .apply(&mut self.mouse.gesture, &self.vt, grid)?;
+            self.selection = selection.as_ref().map(|s| track(&self.vt, s)).transpose()?;
+            self.vt.set_selection(selection.as_ref())?;
+            Ok::<_, Error>(())
+        })();
+        if let Err(e) = result {
+            tracing::error!("Mouse press failed: {e}");
+        }
+    }
+
+    /// Extend the selection to a viewport cell, which may be outside the
+    /// viewport.
+    pub fn mouse_drag(&mut self, col: i32, row: i32) {
+        self.mouse.pointer = (col, row);
+        let (x, y) = cell_center(self.mouse.pointer);
+        let result = (|| {
+            let grid = viewport_ref(&self.vt, self.mouse.pointer)?;
+            let selection = self.mouse.drag.set_position(x, y)?.apply(
+                &mut self.mouse.gesture,
+                &self.vt,
+                grid,
+                geometry(&self.vt)?,
+            )?;
+            if let Some(selection) = selection {
+                self.selection = Some(track(&self.vt, &selection)?);
+                self.vt.set_selection(Some(&selection))?;
+            }
+            Ok::<_, Error>(())
+        })();
+        if let Err(e) = result {
+            tracing::error!("Mouse drag failed: {e}");
+        }
+    }
+
+    /// Finish the gesture. Returns the selected text if the gesture selected
+    /// something; a plain click clears the selection.
+    pub fn mouse_release(&mut self) -> Option<String> {
+        let result = (|| {
+            let grid = viewport_ref(&self.vt, self.mouse.pointer).ok();
+            let gesture = &mut self.mouse.gesture;
+            let selected = gesture.dragged(&self.vt)? || gesture.click_count(&self.vt)? > 1;
+            self.mouse.release.apply(gesture, &self.vt, grid)?;
+            if !selected {
+                self.clear_selection();
+                return Ok(None);
+            }
+            self.selection_text()
+        })();
+        result.unwrap_or_else(|e: Error| {
+            tracing::error!("Mouse release failed: {e}");
+            None
+        })
+    }
+
+    /// Whether a drag is past the viewport edge and wants periodic
+    /// [`Terminal::autoscroll_tick`] calls.
+    pub fn autoscrolling(&self) -> bool {
+        self.mouse
+            .gesture
+            .autoscroll(&self.vt)
+            .is_ok_and(|a| a != Autoscroll::None)
+    }
+
+    /// Scroll one line toward the pointer and extend the selection.
+    pub fn autoscroll_tick(&mut self) {
+        let result = (|| {
+            match self.mouse.gesture.autoscroll(&self.vt)? {
+                Autoscroll::Up => self.scroll_up(1),
+                Autoscroll::Down => self.scroll_down(1),
+                _ => return Ok(()),
+            }
+            let (x, y) = cell_center(self.mouse.pointer);
+            let (col, row) = clamp_to_viewport(&self.vt, self.mouse.pointer)?;
+            let selection = self.mouse.tick.set_position(x, y)?.apply(
+                &mut self.mouse.gesture,
+                &self.vt,
+                PointCoordinate {
+                    x: col,
+                    y: row as u32,
+                },
+                geometry(&self.vt)?,
+            )?;
+            if let Some(selection) = selection {
+                self.selection = Some(track(&self.vt, &selection)?);
+                self.vt.set_selection(Some(&selection))?;
+            }
+            Ok::<_, Error>(())
+        })();
+        if let Err(e) = result {
+            tracing::error!("Autoscroll failed: {e}");
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        let _ = self.vt.set_selection(None);
+    }
+
+    /// Rebuild the current selection from its tracked endpoints.
+    fn selection(&self) -> Result<Option<Selection<'_>>, Error> {
+        let Some((start, end)) = &self.selection else {
+            return Ok(None);
+        };
+        let (Some(start), Some(end)) = (start.snapshot(&self.vt)?, end.snapshot(&self.vt)?) else {
+            return Ok(None);
+        };
+        Ok(Some(Selection::new(start, end, false)))
+    }
+
+    /// Text of the current selection, with soft-wrapped lines joined.
+    pub fn selection_text(&self) -> Result<Option<String>, Error> {
+        let Some(selection) = self.selection()? else {
+            return Ok(None);
+        };
+        let opts = FormatterOptions::new()
+            .with_format(Format::Plain)
+            .with_unwrap(true)
+            .with_trim(true)
+            .with_selection(&selection);
+        let bytes = Formatter::new(&self.vt, opts)?.format_alloc(None)?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
     /// Snapshot the visible rows for rendering.
@@ -522,6 +698,42 @@ impl Terminal {
         let row = m.start.0.saturating_sub(half);
         self.vt.scroll_viewport(ScrollViewport::Row(row as usize));
     }
+}
+
+fn geometry(vt: &Vt) -> Result<Geometry, Error> {
+    Ok(Geometry {
+        columns: vt.cols()? as u32,
+        cell_width: CELL_PX,
+        padding_left: 0,
+        screen_height: vt.rows()? as u32 * CELL_PX,
+    })
+}
+
+fn clamp_to_viewport(vt: &Vt, (col, row): (i32, i32)) -> Result<(u16, u16), Error> {
+    let max_col = vt.cols()?.saturating_sub(1) as i32;
+    let max_row = vt.rows()?.saturating_sub(1) as i32;
+    Ok((col.clamp(0, max_col) as u16, row.clamp(0, max_row) as u16))
+}
+
+fn viewport_ref(vt: &Vt, pointer: (i32, i32)) -> Result<GridRef<'_>, Error> {
+    let (x, y) = clamp_to_viewport(vt, pointer)?;
+    vt.grid_ref(Point::Viewport(PointCoordinate { x, y: y as u32 }))
+}
+
+/// Track a selection's endpoints so it survives terminal updates.
+fn track(vt: &Vt, selection: &Selection<'_>) -> Result<(TrackedGridRef, TrackedGridRef), Error> {
+    let track_ref = |grid: GridRef<'_>| {
+        let point = vt
+            .point_from_grid_ref(&grid, PointSpace::Screen)?
+            .ok_or(Error::InvalidValue)?;
+        vt.track_grid_ref(Point::Screen(point))
+    };
+    Ok((track_ref(selection.start())?, track_ref(selection.end())?))
+}
+
+fn cell_center((col, row): (i32, i32)) -> (f64, f64) {
+    let px = CELL_PX as f64;
+    (col as f64 * px + px / 2.0, row as f64 * px + px / 2.0)
 }
 
 #[cfg(test)]

@@ -87,6 +87,10 @@ pub struct App {
     last_send: Option<Instant>,
     /// Last time data was received from serial (None if never received).
     last_receive: Option<Instant>,
+    /// Pane where a mouse selection drag started.
+    pub dragging: Option<Focus>,
+    /// Reference point for mouse event timestamps.
+    started: Instant,
 }
 
 /// A transient message to display in the UI.
@@ -116,23 +120,44 @@ impl App {
             message: None,
             last_send: None,
             last_receive: None,
+            dragging: None,
+            started: Instant::now(),
         })
     }
 
-    /// Get a reference to the focused terminal.
-    pub fn focused_terminal(&self) -> &Terminal {
-        match self.focus {
+    pub fn terminal(&self, pane: Focus) -> &Terminal {
+        match pane {
             Focus::App => &self.app_terminal,
             Focus::Kernel => &self.kernel_terminal,
         }
     }
 
-    /// Get a mutable reference to the focused terminal.
-    pub fn focused_terminal_mut(&mut self) -> &mut Terminal {
-        match self.focus {
+    pub fn terminal_mut(&mut self, pane: Focus) -> &mut Terminal {
+        match pane {
             Focus::App => &mut self.app_terminal,
             Focus::Kernel => &mut self.kernel_terminal,
         }
+    }
+
+    /// Get a reference to the focused terminal.
+    pub fn focused_terminal(&self) -> &Terminal {
+        self.terminal(self.focus)
+    }
+
+    /// Get a mutable reference to the focused terminal.
+    pub fn focused_terminal_mut(&mut self) -> &mut Terminal {
+        self.terminal_mut(self.focus)
+    }
+
+    /// Time since startup, for mouse click timing.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Whether a mouse drag is past a pane edge and needs autoscroll ticks.
+    pub fn autoscrolling(&self) -> bool {
+        self.dragging
+            .is_some_and(|pane| self.terminal(pane).autoscrolling())
     }
 
     /// Record that data was sent to serial.

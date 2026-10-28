@@ -1,4 +1,5 @@
 pub mod app;
+pub mod clipboard;
 mod filter;
 pub mod input;
 pub mod serial;

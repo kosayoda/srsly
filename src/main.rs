@@ -6,6 +6,7 @@ use dialoguer::theme::ColorfulTheme;
 use owo_colors::OwoColorize;
 
 use srsly::app::App;
+use srsly::clipboard;
 use srsly::input::{KeyAction, handle_key, handle_mouse, handle_paste};
 use srsly::serial::{self, SerialConfig, SerialWriter};
 use srsly::tui::{Event, TerminalEvent, Tui, TuiConfig};
@@ -180,6 +181,12 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
             Event::Init | Event::NoResponseTimeout => {
                 // NoResponseTimeout just triggers a redraw (handled below)
             }
+            Event::AutoscrollTick => {
+                if let Some(pane) = app.dragging {
+                    app.terminal_mut(pane).autoscroll_tick();
+                }
+                tui.set_autoscroll(app.autoscrolling());
+            }
             Event::AppData(data) => {
                 app.record_receive();
                 tui.set_no_response_deadline(None);
@@ -232,6 +239,7 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
                         KeyAction::SearchChanged => {
                             app.focused_terminal_mut().update_search_matches();
                         }
+                        KeyAction::Copy(text) => copy(&mut app, &text),
                         KeyAction::None => {}
                     }
                 }
@@ -256,7 +264,10 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
                 }
                 TerminalEvent::Mouse(mouse) => {
                     let layout = ui::UiLayout::compute(frame_size, app.layout);
-                    handle_mouse(&mut app, mouse, layout.pane_areas());
+                    if let KeyAction::Copy(text) = handle_mouse(&mut app, mouse, &layout) {
+                        copy(&mut app, &text);
+                    }
+                    tui.set_autoscroll(app.autoscrolling());
                 }
                 TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
                 TerminalEvent::Error(err) => {
@@ -270,4 +281,11 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn copy(app: &mut App, text: &str) {
+    match clipboard::copy(text) {
+        Ok(()) => app.show_info(format!("Copied {} lines", text.lines().count())),
+        Err(e) => app.show_error(format!("Copy failed: {e}")),
+    }
 }
