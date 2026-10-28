@@ -18,6 +18,8 @@ pub enum Mode {
     Normal,
     /// Searching within panes.
     Search,
+    /// Selecting text with the keyboard.
+    Visual,
 }
 
 /// Serial connection state.

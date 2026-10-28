@@ -2,8 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use smallvec::{SmallVec, smallvec};
 
 use crate::app::{App, Focus, Mode};
-use crate::terminal::SearchDirection;
+use crate::terminal::{SearchDirection, VisualMode};
 use crate::ui::{UiLayout, pane_inner};
+use libghostty_vt::selection::Adjustment;
 
 /// Lines scrolled per mouse wheel step.
 const WHEEL_LINES: usize = 3;
@@ -32,6 +33,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
         Mode::Insert => handle_insert_mode(app, key),
         Mode::Normal => handle_normal_mode(app, key),
         Mode::Search => handle_search_mode(app, key),
+        Mode::Visual => handle_visual_mode(app, key),
     }
 }
 
@@ -39,7 +41,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 pub fn handle_paste(app: &mut App, text: &str) -> KeyAction {
     match app.mode {
         Mode::Insert => KeyAction::Send(text.as_bytes().into()),
-        Mode::Normal | Mode::Search => {
+        Mode::Normal | Mode::Search | Mode::Visual => {
             app.show_info("Paste ignored (not in Insert mode)");
             KeyAction::None
         }
@@ -56,6 +58,9 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, layout: &UiLayout) -> KeyA
                 return KeyAction::None;
             };
             app.focus = pane;
+            if app.mode == Mode::Visual {
+                app.mode = Mode::Normal;
+            }
             for other in [Focus::App, Focus::Kernel] {
                 app.terminal_mut(other).clear_selection();
             }
@@ -227,6 +232,18 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
             KeyAction::None
         }
 
+        // Start keyboard selection
+        KeyCode::Char('v') => {
+            focused_terminal(app).visual_start(VisualMode::Char);
+            app.mode = Mode::Visual;
+            KeyAction::None
+        }
+        KeyCode::Char('V') => {
+            focused_terminal(app).visual_start(VisualMode::Line);
+            app.mode = Mode::Visual;
+            KeyAction::None
+        }
+
         // Clear search highlights and selection
         KeyCode::Esc => {
             let terminal = focused_terminal(app);
@@ -292,6 +309,64 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> KeyAction {
 
         _ => KeyAction::None,
     }
+}
+
+/// Visual mode: keys move the selection head, `y` copies.
+fn handle_visual_mode(app: &mut App, key: KeyEvent) -> KeyAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let terminal = focused_terminal(app);
+
+    let adjustment = match key.code {
+        KeyCode::Char('d') if ctrl => Some(Adjustment::PageDown),
+        KeyCode::Char('u') if ctrl => Some(Adjustment::PageUp),
+        KeyCode::Char('h') | KeyCode::Left => Some(Adjustment::Left),
+        KeyCode::Char('j') | KeyCode::Down => Some(Adjustment::Down),
+        KeyCode::Char('k') | KeyCode::Up => Some(Adjustment::Up),
+        KeyCode::Char('l') | KeyCode::Right => Some(Adjustment::Right),
+        KeyCode::Char('0') | KeyCode::Home => Some(Adjustment::BeginningOfLine),
+        KeyCode::Char('$') | KeyCode::End => Some(Adjustment::EndOfLine),
+        KeyCode::Char('g') => Some(Adjustment::Home),
+        KeyCode::Char('G') => Some(Adjustment::End),
+        _ => None,
+    };
+    if let Some(adjustment) = adjustment {
+        terminal.visual_move(adjustment);
+        return KeyAction::None;
+    }
+
+    let action = match key.code {
+        KeyCode::Char('o') => {
+            terminal.visual_swap();
+            return KeyAction::None;
+        }
+        KeyCode::Char('n') => {
+            terminal.visual_jump(true);
+            return KeyAction::None;
+        }
+        KeyCode::Char('N') => {
+            terminal.visual_jump(false);
+            return KeyAction::None;
+        }
+        // v/V switch granularity, or leave visual mode if already in it
+        KeyCode::Char('v') if terminal.visual() != Some(VisualMode::Char) => {
+            terminal.set_visual_mode(VisualMode::Char);
+            return KeyAction::None;
+        }
+        KeyCode::Char('V') if terminal.visual() != Some(VisualMode::Line) => {
+            terminal.set_visual_mode(VisualMode::Line);
+            return KeyAction::None;
+        }
+        KeyCode::Char('v' | 'V') | KeyCode::Esc => KeyAction::None,
+        KeyCode::Char('y') => match terminal.selection_text() {
+            Ok(Some(text)) => KeyAction::Copy(text),
+            _ => KeyAction::None,
+        },
+        _ => return KeyAction::None,
+    };
+
+    terminal.clear_selection();
+    app.mode = Mode::Normal;
+    action
 }
 
 /// Get mutable reference to the focused terminal.

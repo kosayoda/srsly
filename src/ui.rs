@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ConnectionState, Focus, Layout as AppLayout, MessageLevel, Mode};
-use crate::terminal::{SearchDirection, Terminal};
+use crate::terminal::{SearchDirection, Terminal, VisualMode};
 use libghostty_vt::style::{Style as CellStyle, StyleColor, Underline};
 
 /// Computed layout areas for the UI.
@@ -265,6 +265,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(": Layout  "),
                 Span::styled("/", key_style),
                 Span::raw(": Search  "),
+                Span::styled("v", key_style),
+                Span::raw(": Select  "),
                 Span::styled("j/k", key_style),
                 Span::raw(": Scroll"),
             ];
@@ -293,6 +295,23 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
                 binds,
             )
         }
+        Mode::Visual => (
+            match app.focused_terminal().visual() {
+                Some(VisualMode::Line) => " V-LINE ",
+                _ => " VISUAL ",
+            },
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+            vec![
+                Span::styled("hjkl 0$ gG", key_style),
+                Span::raw(": Move  "),
+                Span::styled("o", key_style),
+                Span::raw(": Swap  "),
+                Span::styled("y", key_style),
+                Span::raw(": Copy  "),
+                Span::styled("Esc", key_style),
+                Span::raw(": Cancel"),
+            ],
+        ),
         Mode::Search => {
             // Show search input with pattern
             let pattern_style = if search.error {

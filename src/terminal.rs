@@ -7,7 +7,7 @@ use libghostty_vt::{
     render::{CellIterator, RenderState, RowIterator},
     screen::{CellContentTag, CellWide, GridRef, TrackedGridRef},
     selection::{
-        Selection,
+        Adjustment, SelectLineOptions, Selection,
         gesture::{
             Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
         },
@@ -37,8 +37,17 @@ pub struct Terminal {
     /// New output arrived since matches were computed.
     search_stale: bool,
     mouse: Mouse,
-    /// Tracked endpoints of the active selection.
+    /// Tracked endpoints of the active selection: (anchor, head).
     selection: Option<(TrackedGridRef, TrackedGridRef)>,
+    /// Set while the selection is driven from the keyboard.
+    visual: Option<VisualMode>,
+}
+
+/// Keyboard selection granularity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualMode {
+    Char,
+    Line,
 }
 
 /// Selection gesture state and reusable event objects.
@@ -236,6 +245,7 @@ impl Terminal {
                 pointer: (0, 0),
             },
             selection: None,
+            visual: None,
         })
     }
 
@@ -311,6 +321,7 @@ impl Terminal {
     /// Start a selection gesture at a viewport cell. `time` is a monotonic
     /// timestamp used to detect double and triple clicks.
     pub fn mouse_press(&mut self, col: u16, row: u16, time: Duration) {
+        self.visual = None;
         self.mouse.pointer = (col as i32, row as i32);
         let (x, y) = cell_center(self.mouse.pointer);
         let result = (|| {
@@ -417,18 +428,164 @@ impl Terminal {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.visual = None;
         let _ = self.vt.set_selection(None);
     }
 
-    /// Rebuild the current selection from its tracked endpoints.
+    pub fn visual(&self) -> Option<VisualMode> {
+        self.visual
+    }
+
+    /// Start a keyboard selection at the current search match, the cursor
+    /// when viewing live output, or the bottom-left of the viewport.
+    pub fn visual_start(&mut self, mode: VisualMode) {
+        let result = (|| {
+            let point = match self.search.current() {
+                Some(m) => Point::Screen(PointCoordinate {
+                    x: m.start.1,
+                    y: m.start.0,
+                }),
+                None if self.scroll_offset() == 0 => Point::Active(PointCoordinate {
+                    x: 0,
+                    y: self.vt.cursor_y()? as u32,
+                }),
+                None => Point::Viewport(PointCoordinate {
+                    x: 0,
+                    y: self.vt.rows()?.saturating_sub(1) as u32,
+                }),
+            };
+            let grid = self.vt.grid_ref(point)?;
+            self.selection = Some((
+                track_ref(&self.vt, grid.clone())?,
+                track_ref(&self.vt, grid)?,
+            ));
+            self.visual = Some(mode);
+            self.apply_selection()
+        })();
+        if let Err(e) = result {
+            tracing::error!("Visual start failed: {e}");
+            self.clear_selection();
+        }
+    }
+
+    /// Switch between character and line selection.
+    pub fn set_visual_mode(&mut self, mode: VisualMode) {
+        self.visual = Some(mode);
+        if let Err(e) = self.apply_selection() {
+            tracing::error!("Visual mode change failed: {e}");
+        }
+    }
+
+    /// Move the selection head.
+    pub fn visual_move(&mut self, adjustment: Adjustment) {
+        let result = (|| {
+            let Some((anchor, head)) = &self.selection else {
+                return Ok(());
+            };
+            let (Some(anchor), Some(head)) = (anchor.snapshot(&self.vt)?, head.snapshot(&self.vt)?)
+            else {
+                return Ok(());
+            };
+            let mut selection = Selection::new(anchor, head, false);
+            selection.adjust(&self.vt, adjustment)?;
+            let head = track_ref(&self.vt, selection.end())?;
+            if let Some(selection) = &mut self.selection {
+                selection.1 = head;
+            }
+            self.apply_selection()?;
+            self.scroll_to_head()
+        })();
+        if let Err(e) = result {
+            tracing::error!("Visual move failed: {e}");
+        }
+    }
+
+    /// Swap the selection anchor and head.
+    pub fn visual_swap(&mut self) {
+        if let Some((anchor, head)) = self.selection.take() {
+            self.selection = Some((head, anchor));
+        }
+        if let Err(e) = self.scroll_to_head() {
+            tracing::error!("Visual swap failed: {e}");
+        }
+    }
+
+    /// Move the selection head to the next or previous search match.
+    pub fn visual_jump(&mut self, next: bool) {
+        if next {
+            self.next_match();
+        } else {
+            self.prev_match();
+        }
+        let Some(m) = self.search.current() else {
+            return;
+        };
+        let result = (|| {
+            let grid = self.vt.grid_ref(Point::Screen(PointCoordinate {
+                x: m.start.1,
+                y: m.start.0,
+            }))?;
+            let head = track_ref(&self.vt, grid)?;
+            if let Some(selection) = &mut self.selection {
+                selection.1 = head;
+            }
+            self.apply_selection()
+        })();
+        if let Err(e) = result {
+            tracing::error!("Visual jump failed: {e}");
+        }
+    }
+
+    /// Install the current selection as the terminal's highlighted selection.
+    fn apply_selection(&mut self) -> Result<(), Error> {
+        let selection = self.selection()?;
+        self.vt.set_selection(selection.as_ref())?;
+        Ok(())
+    }
+
+    /// Scroll the viewport so the selection head is visible.
+    fn scroll_to_head(&mut self) -> Result<(), Error> {
+        let Some((_, head)) = &self.selection else {
+            return Ok(());
+        };
+        let Some(y) = head.point(PointSpace::Screen)?.map(|p| p.y as usize) else {
+            return Ok(());
+        };
+        let top = self.vt.scrollbar()?.offset as usize;
+        let rows = self.vt.rows()? as usize;
+        if y < top {
+            self.vt.scroll_viewport(ScrollViewport::Row(y));
+        } else if y >= top + rows {
+            self.vt.scroll_viewport(ScrollViewport::Row(y + 1 - rows));
+        }
+        Ok(())
+    }
+
+    /// Rebuild the current selection from its tracked endpoints, extending
+    /// it to whole lines in line mode.
     fn selection(&self) -> Result<Option<Selection<'_>>, Error> {
-        let Some((start, end)) = &self.selection else {
+        let Some((anchor, head)) = &self.selection else {
             return Ok(None);
         };
-        let (Some(start), Some(end)) = (start.snapshot(&self.vt)?, end.snapshot(&self.vt)?) else {
+        let (Some(anchor), Some(head)) = (anchor.snapshot(&self.vt)?, head.snapshot(&self.vt)?)
+        else {
             return Ok(None);
         };
-        Ok(Some(Selection::new(start, end, false)))
+        if self.visual != Some(VisualMode::Line) {
+            return Ok(Some(Selection::new(anchor, head, false)));
+        }
+
+        let point = |g| self.vt.point_from_grid_ref(g, PointSpace::Screen);
+        let forward = point(&head)?.map(|p| (p.y, p.x)) >= point(&anchor)?.map(|p| (p.y, p.x));
+        let line = |g: GridRef<'_>| self.vt.select_line(SelectLineOptions::new(g));
+        let (Some(anchor), Some(head)) = (line(anchor)?, line(head)?) else {
+            return Ok(None);
+        };
+        Ok(Some(if forward {
+            Selection::new(anchor.start(), head.end(), false)
+        } else {
+            Selection::new(anchor.end(), head.start(), false)
+        }))
     }
 
     /// Text of the current selection, with soft-wrapped lines joined.
@@ -455,11 +612,18 @@ impl Terminal {
 
     fn try_viewport(&mut self) -> Result<Viewport, Error> {
         let top = self.vt.scrollbar()?.offset as u32;
+        let head = match (&self.selection, self.visual) {
+            (Some((_, head)), Some(_)) => head.point(PointSpace::Viewport)?,
+            _ => None,
+        };
         let snapshot = self.render.update(&self.vt)?;
-        let cursor = snapshot
-            .cursor_viewport()?
-            .filter(|_| snapshot.cursor_visible().unwrap_or(true))
-            .map(|c| (c.x, c.y));
+        let cursor = match head {
+            Some(head) => Some((head.x, head.y as u16)),
+            None => snapshot
+                .cursor_viewport()?
+                .filter(|_| snapshot.cursor_visible().unwrap_or(true))
+                .map(|c| (c.x, c.y)),
+        };
 
         let mut rows = Vec::new();
         let mut row_iter = self.row_iter.update(&snapshot)?;
@@ -720,15 +884,20 @@ fn viewport_ref(vt: &Vt, pointer: (i32, i32)) -> Result<GridRef<'_>, Error> {
     vt.grid_ref(Point::Viewport(PointCoordinate { x, y: y as u32 }))
 }
 
+/// Track a grid position so it survives terminal updates.
+fn track_ref(vt: &Vt, grid: GridRef<'_>) -> Result<TrackedGridRef, Error> {
+    let point = vt
+        .point_from_grid_ref(&grid, PointSpace::Screen)?
+        .ok_or(Error::InvalidValue)?;
+    vt.track_grid_ref(Point::Screen(point))
+}
+
 /// Track a selection's endpoints so it survives terminal updates.
 fn track(vt: &Vt, selection: &Selection<'_>) -> Result<(TrackedGridRef, TrackedGridRef), Error> {
-    let track_ref = |grid: GridRef<'_>| {
-        let point = vt
-            .point_from_grid_ref(&grid, PointSpace::Screen)?
-            .ok_or(Error::InvalidValue)?;
-        vt.track_grid_ref(Point::Screen(point))
-    };
-    Ok((track_ref(selection.start())?, track_ref(selection.end())?))
+    Ok((
+        track_ref(vt, selection.start())?,
+        track_ref(vt, selection.end())?,
+    ))
 }
 
 fn cell_center((col, row): (i32, i32)) -> (f64, f64) {
