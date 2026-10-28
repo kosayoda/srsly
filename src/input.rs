@@ -180,19 +180,13 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> KeyAction {
 
         // Next match (n) - follows search direction
         KeyCode::Char('n') => {
-            let terminal = focused_terminal(app);
-            if let Some(m) = terminal.search.next_match() {
-                terminal.scroll_to_match(m);
-            }
+            focused_terminal(app).next_match();
             KeyAction::None
         }
 
         // Previous match (N) - opposite of search direction
         KeyCode::Char('N') => {
-            let terminal = focused_terminal(app);
-            if let Some(m) = terminal.search.prev_match() {
-                terminal.scroll_to_match(m);
-            }
+            focused_terminal(app).prev_match();
             KeyAction::None
         }
 
@@ -241,19 +235,13 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) -> KeyAction {
 
         // Next match
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let terminal = focused_terminal(app);
-            if let Some(m) = terminal.search.next_match() {
-                terminal.scroll_to_match(m);
-            }
+            focused_terminal(app).next_match();
             KeyAction::None
         }
 
         // Previous match
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let terminal = focused_terminal(app);
-            if let Some(m) = terminal.search.prev_match() {
-                terminal.scroll_to_match(m);
-            }
+            focused_terminal(app).prev_match();
             KeyAction::None
         }
 

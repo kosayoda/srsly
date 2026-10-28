@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use crate::terminal::Terminal;
 
-/// Default scrollback lines for terminals.
-const SCROLLBACK_LINES: usize = 10_000;
+/// Scrollback memory per terminal; roughly 9k rows at 120 columns.
+const SCROLLBACK_BYTES: usize = 10 * 1024 * 1024;
 
 /// How long to wait after sending before showing "no response" warning.
 const NO_RESPONSE_THRESHOLD: Duration = Duration::from_secs(2);
@@ -104,10 +104,10 @@ pub enum MessageLevel {
 }
 
 impl App {
-    pub fn new(rows: u16, cols: u16) -> Self {
-        Self {
-            app_terminal: Terminal::new(rows, cols, SCROLLBACK_LINES),
-            kernel_terminal: Terminal::new(rows, cols, SCROLLBACK_LINES),
+    pub fn new(rows: u16, cols: u16) -> Result<Self, libghostty_vt::error::Error> {
+        Ok(Self {
+            app_terminal: Terminal::new(rows, cols, SCROLLBACK_BYTES)?,
+            kernel_terminal: Terminal::new(rows, cols, SCROLLBACK_BYTES)?,
             mode: Mode::default(),
             focus: Focus::App,
             layout: Layout::default(),
@@ -116,7 +116,7 @@ impl App {
             message: None,
             last_send: None,
             last_receive: None,
-        }
+        })
     }
 
     /// Get a reference to the focused terminal.
@@ -218,15 +218,8 @@ impl App {
     }
 
     /// Resize both terminal panes.
-    /// Resize both terminal panes.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.app_terminal.set_size(rows, cols);
         self.kernel_terminal.set_size(rows, cols);
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new(24, 80)
     }
 }

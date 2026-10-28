@@ -1,15 +1,26 @@
-use vt100::Parser;
+use libghostty_vt::{
+    Terminal as Vt, TerminalOptions,
+    error::Error,
+    fmt::{Format, Formatter, FormatterOptions},
+    render::{CellIterator, RenderState, RowIterator},
+    screen::{CellContentTag, CellWide, TrackedGridRef},
+    style::{Style, StyleColor},
+    terminal::{Point, PointCoordinate, PointSpace, ScrollViewport},
+};
 
-/// A scrollable terminal backed by a vt100 parser.
+/// A scrollable terminal backed by libghostty-vt.
 pub struct Terminal {
-    /// The vt100 parser/screen state
-    parser: Parser,
-    /// Scrollback offset (0 = at bottom, showing live output)
-    scroll_offset: usize,
-    /// Cached total scrollback length (updated on scroll operations)
-    scrollback_len: usize,
+    vt: Vt<'static, 'static>,
+    render: RenderState<'static>,
+    row_iter: RowIterator<'static>,
+    cell_iter: CellIterator<'static>,
     /// Search state for this terminal
     pub search: SearchState,
+    /// Tracks the screen row of the newest match so match rows can be
+    /// shifted when scrollback is evicted.
+    search_anchor: Option<(TrackedGridRef, u32)>,
+    /// New output arrived since matches were computed.
+    search_stale: bool,
 }
 
 /// Search direction (vim-style).
@@ -31,25 +42,31 @@ pub struct SearchState {
     pub regex: Option<regex::Regex>,
     /// Whether the pattern is invalid.
     pub error: bool,
-    /// Matches found: (row, start_col, end_col). Row is absolute (0 = oldest scrollback line).
+    /// Matches in screen order.
     pub matches: Vec<SearchMatch>,
     /// Current match index (for n/N navigation).
     pub current_match: usize,
     /// Search direction (/ = forward, ? = backward).
     pub direction: SearchDirection,
+    /// Screen rows visible when the search started; matches are picked
+    /// relative to this so typing doesn't drift the view.
+    origin: Option<(u32, u32)>,
 }
 
-/// A single search match location.
-#[derive(Debug, Clone, Copy)]
+/// A search match in screen coordinates (row 0 = oldest scrollback row).
+/// Matches can span soft-wrapped rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
-    /// Scroll offset when this row is at position `view_row`.
-    pub scroll_offset: usize,
-    /// Row index within the visible screen (0 = top of visible area).
-    pub view_row: usize,
-    /// Start column (0-based, byte offset in row text).
-    pub start_col: usize,
-    /// End column (exclusive).
-    pub end_col: usize,
+    /// (row, col) of the first cell.
+    pub start: (u32, u16),
+    /// (row, col) one past the last cell.
+    pub end: (u32, u16),
+}
+
+impl SearchMatch {
+    pub fn contains(&self, row: u32, col: u16) -> bool {
+        (row, col) >= self.start && (row, col) < self.end
+    }
 }
 
 impl SearchState {
@@ -104,6 +121,7 @@ impl SearchState {
         self.error = false;
         self.matches.clear();
         self.current_match = 0;
+        self.origin = None;
         // Note: direction is preserved so repeated searches use same direction
     }
 
@@ -128,290 +146,430 @@ impl SearchState {
         self.matches.get(self.current_match).copied()
     }
 
-    /// `n` key - move in the search direction.
-    /// Forward search (`/`): n goes down (newer), N goes up (older)
-    /// Backward search (`?`): n goes up (older), N goes down (newer)
-    pub fn next_match(&mut self) -> Option<SearchMatch> {
-        match self.direction {
-            SearchDirection::Forward => self.move_forward(),
-            SearchDirection::Backward => self.move_backward(),
-        }
-    }
-
-    /// `N` key - move opposite to search direction.
-    pub fn prev_match(&mut self) -> Option<SearchMatch> {
-        match self.direction {
-            SearchDirection::Forward => self.move_backward(),
-            SearchDirection::Backward => self.move_forward(),
-        }
-    }
-
     /// Get current match.
     pub fn current(&self) -> Option<SearchMatch> {
         self.matches.get(self.current_match).copied()
     }
+
+    /// Matches that intersect screen rows `top..top + rows`.
+    pub fn visible(&self, top: u32, rows: u16) -> &[SearchMatch] {
+        let bottom = top + rows as u32;
+        let lo = self.matches.partition_point(|m| m.end.0 < top);
+        let hi = self.matches.partition_point(|m| m.start.0 < bottom);
+        &self.matches[lo..hi.max(lo)]
+    }
+}
+
+/// One rendered cell. Spacer cells after wide characters are omitted.
+pub struct ViewCell {
+    pub col: u16,
+    pub text: String,
+    pub style: Style,
+}
+
+pub struct ViewRow {
+    pub cells: Vec<ViewCell>,
+    /// Selected column range, inclusive.
+    pub selection: Option<(u16, u16)>,
+}
+
+/// A snapshot of the visible rows.
+#[derive(Default)]
+pub struct Viewport {
+    pub rows: Vec<ViewRow>,
+    /// Screen row of the first viewport row.
+    pub top: u32,
+    pub cursor: Option<(u16, u16)>,
 }
 
 impl Terminal {
     /// Create a new terminal with the given dimensions.
-    pub fn new(rows: u16, cols: u16, scrollback_lines: usize) -> Self {
-        Self {
-            parser: Parser::new(rows, cols, scrollback_lines),
-            scroll_offset: 0,
-            scrollback_len: 0,
+    pub fn new(rows: u16, cols: u16, scrollback_bytes: usize) -> Result<Self, Error> {
+        Ok(Self {
+            vt: Vt::new(TerminalOptions {
+                cols: cols.max(1),
+                rows: rows.max(1),
+                max_scrollback: scrollback_bytes,
+            })?,
+            render: RenderState::new()?,
+            row_iter: RowIterator::new()?,
+            cell_iter: CellIterator::new()?,
             search: SearchState::default(),
-        }
+            search_anchor: None,
+            search_stale: false,
+        })
     }
 
     /// Process incoming bytes.
     pub fn process(&mut self, data: &[u8]) {
-        self.parser.process(data);
-        self.update_scrollback_len();
-    }
-
-    /// Update the cached scrollback length by querying vt100.
-    fn update_scrollback_len(&mut self) {
-        let original = self.scroll_offset;
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        self.scrollback_len = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(original);
-    }
-
-    /// Get the underlying screen for rendering.
-    pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+        self.vt.vt_write(data);
+        if self.search.regex.is_some() {
+            self.search_stale = true;
+            self.shift_matches();
+        }
     }
 
     /// Resize the terminal.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        if let Err(e) = self.vt.resize(cols.max(1), rows.max(1), 1, 1) {
+            tracing::error!("Resize failed: {e}");
+        }
+        if self.search.regex.is_some() {
+            self.update_search_matches();
+        }
     }
 
     /// Get the current size (rows, cols).
-    #[allow(dead_code)]
     pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
+        (
+            self.vt.rows().unwrap_or_default(),
+            self.vt.cols().unwrap_or_default(),
+        )
     }
 
-    /// Scroll up by n lines (clamped to scrollback bounds).
+    /// Scroll up by n lines.
     pub fn scroll_up(&mut self, n: usize) {
-        let new_offset = self.scroll_offset.saturating_add(n);
-        self.parser.screen_mut().set_scrollback(new_offset);
-        // Read back the clamped value
-        self.scroll_offset = self.parser.screen().scrollback();
+        self.vt
+            .scroll_viewport(ScrollViewport::Delta(-(n as isize)));
     }
 
-    /// Scroll down by n lines (clamped to 0).
+    /// Scroll down by n lines.
     pub fn scroll_down(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
-        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+        self.vt.scroll_viewport(ScrollViewport::Delta(n as isize));
     }
 
     /// Scroll to top of scrollback.
     pub fn scroll_to_top(&mut self) {
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        // Read back the clamped value (actual max scrollback)
-        self.scroll_offset = self.parser.screen().scrollback();
+        self.vt.scroll_viewport(ScrollViewport::Top);
     }
 
     /// Scroll to bottom (live view).
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
-        self.parser.screen_mut().set_scrollback(0);
+        self.vt.scroll_viewport(ScrollViewport::Bottom);
     }
 
-    /// Check if at the bottom (live view).
-    pub fn is_at_bottom(&self) -> bool {
-        self.scroll_offset == 0
-    }
-
-    /// Get current scroll offset.
+    /// Lines scrolled up from the bottom (0 = live view).
     pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.vt
+            .scrollbar()
+            .map(|s| (s.total - s.len - s.offset) as usize)
+            .unwrap_or_default()
     }
 
-    /// Get total scrollback length (lines available to scroll back).
+    /// Lines available to scroll back.
     pub fn scrollback_len(&self) -> usize {
-        self.scrollback_len
+        self.vt.scrollback_rows().unwrap_or_default()
     }
 
-    /// Clear the screen and scrollback, reset to bottom.
+    /// Clear the screen and scrollback.
     pub fn clear(&mut self) {
-        // Send clear screen + cursor home sequences to the parser
-        // \x1b[2J = clear entire screen
-        // \x1b[H = cursor to home position
-        // \x1b[3J = clear scrollback (xterm extension)
-        self.parser.process(b"\x1b[2J\x1b[H\x1b[3J");
-        self.scroll_offset = 0;
-        self.scrollback_len = 0;
-    }
-
-    /// Search for regex matches in the entire terminal (visible + scrollback).
-    /// Updates self.search.matches with results.
-    pub fn update_search_matches(&mut self) {
+        self.vt.vt_write(b"\x1b[H\x1b[2J\x1b[3J");
         self.search.matches.clear();
+        self.search.current_match = 0;
+        self.search_anchor = None;
+    }
 
-        let regex = match &self.search.regex {
-            Some(r) => r.clone(),
-            None => return,
-        };
+    /// Snapshot the visible rows for rendering.
+    pub fn viewport(&mut self) -> Viewport {
+        self.try_viewport().unwrap_or_else(|e| {
+            tracing::error!("Failed to read viewport: {e}");
+            Viewport::default()
+        })
+    }
 
-        let (visible_rows, cols) = self.parser.screen().size();
-        let original_offset = self.scroll_offset;
+    fn try_viewport(&mut self) -> Result<Viewport, Error> {
+        let top = self.vt.scrollbar()?.offset as u32;
+        let snapshot = self.render.update(&self.vt)?;
+        let cursor = snapshot
+            .cursor_viewport()?
+            .filter(|_| snapshot.cursor_visible().unwrap_or(true))
+            .map(|c| (c.x, c.y));
 
-        // Search all content by scrolling through it
-        // We iterate from highest offset (oldest content) to 0 (newest content)
-        let max_offset = self.scrollback_len;
-
-        for offset in (0..=max_offset).rev() {
-            self.parser.screen_mut().set_scrollback(offset);
-
-            // At each offset, determine which rows to search to avoid duplicates
-            // - At max_offset: search all rows (0 to visible_rows-1)
-            // - At other offsets: only search the bottom row (it's newly revealed)
-            let rows_to_search = if offset == max_offset {
-                0..visible_rows as usize
-            } else {
-                (visible_rows as usize - 1)..visible_rows as usize
-            };
-
-            for view_row in rows_to_search {
-                // Get row text and track byte-to-column mapping
-                let mut row_text = String::new();
-                let mut byte_to_col: Vec<usize> = Vec::new();
-
-                for col in 0..cols {
-                    if let Some(cell) = self.parser.screen().cell(view_row as u16, col) {
-                        let contents = cell.contents();
-                        for _ in contents.bytes() {
-                            byte_to_col.push(col as usize);
+        let mut rows = Vec::new();
+        let mut row_iter = self.row_iter.update(&snapshot)?;
+        while let Some(row) = row_iter.next() {
+            let mut cells = Vec::new();
+            let mut cell_iter = self.cell_iter.update(row)?;
+            let mut col = 0;
+            while let Some(cell) = cell_iter.next() {
+                let raw = cell.raw_cell()?;
+                if raw.wide()? != CellWide::SpacerTail {
+                    let mut text = String::new();
+                    cell.graphemes_utf8(&mut text)?;
+                    let mut style = if cell.has_styling()? {
+                        cell.style()?
+                    } else {
+                        Style::default()
+                    };
+                    match raw.content_tag()? {
+                        CellContentTag::BgColorPalette => {
+                            style.bg_color = StyleColor::Palette(raw.bg_color_palette()?)
                         }
-                        row_text.push_str(contents);
+                        CellContentTag::BgColorRgb => {
+                            style.bg_color = StyleColor::Rgb(raw.bg_color_rgb()?)
+                        }
+                        _ => {}
                     }
+                    cells.push(ViewCell { col, text, style });
                 }
-
-                // Find regex matches and convert byte positions to column positions
-                for m in regex.find_iter(&row_text) {
-                    let start_col = byte_to_col.get(m.start()).copied().unwrap_or(0);
-                    let end_col = byte_to_col
-                        .get(m.end().saturating_sub(1))
-                        .copied()
-                        .map(|c| c + 1)
-                        .unwrap_or(cols as usize);
-
-                    self.search.matches.push(SearchMatch {
-                        scroll_offset: offset,
-                        view_row,
-                        start_col,
-                        end_col,
-                    });
-                }
+                col += 1;
             }
+            let selection = row.selection()?.map(|s| (s.start_x, s.end_x));
+            rows.push(ViewRow { cells, selection });
         }
 
-        // Restore original scroll position
-        self.parser.screen_mut().set_scrollback(original_offset);
-        self.scroll_offset = original_offset;
+        Ok(Viewport { rows, top, cursor })
+    }
 
-        // If we found matches, set current_match based on search direction
-        if !self.search.matches.is_empty() {
-            self.search.current_match = match self.search.direction {
-                SearchDirection::Forward => self.find_first_match_at_or_after_view(),
-                SearchDirection::Backward => self.find_last_match_at_or_before_view(),
+    /// Search the whole buffer for the current regex.
+    pub fn update_search_matches(&mut self) {
+        let previous = self.search.current().map(|m| m.start);
+        self.search.matches.clear();
+        self.search.current_match = 0;
+        self.search_anchor = None;
+        self.search_stale = false;
+
+        let Some(regex) = self.search.regex.clone() else {
+            return;
+        };
+        match self.find_matches(&regex) {
+            Ok(matches) => self.search.matches = matches,
+            Err(e) => {
+                tracing::error!("Search failed: {e}");
+                return;
+            }
+        }
+        let Some(last) = self.search.matches.last() else {
+            return;
+        };
+        let row = last.start.0;
+        self.search_anchor = self
+            .vt
+            .track_grid_ref(Point::Screen(PointCoordinate { x: 0, y: row }))
+            .ok()
+            .map(|r| (r, row));
+
+        if let Some(i) =
+            previous.and_then(|p| self.search.matches.iter().position(|m| m.start == p))
+        {
+            self.search.current_match = i;
+            return;
+        }
+
+        let (top, bottom) = *self.search.origin.get_or_insert_with(|| {
+            let top = self.vt.scrollbar().map(|s| s.offset as u32).unwrap_or(0);
+            (top, top + self.vt.rows().unwrap_or_default() as u32)
+        });
+        let matches = &self.search.matches;
+        self.search.current_match = match self.search.direction {
+            SearchDirection::Forward => matches.iter().position(|m| m.start.0 >= top).unwrap_or(0),
+            SearchDirection::Backward => matches
+                .iter()
+                .rposition(|m| m.start.0 < bottom)
+                .unwrap_or(matches.len() - 1),
+        };
+        if let Some(m) = self.search.current() {
+            self.scroll_to_match(m);
+        }
+    }
+
+    fn find_matches(&self, regex: &regex::Regex) -> Result<Vec<SearchMatch>, Error> {
+        // One line per screen row; soft-wrapped rows are joined below.
+        let opts = FormatterOptions::new()
+            .with_format(Format::Plain)
+            .with_unwrap(false)
+            .with_trim(false);
+        let bytes = Formatter::new(&self.vt, opts)?.format_alloc(None)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let rows: Vec<&str> = text.split('\n').collect();
+
+        let mut matches = Vec::new();
+        let mut line = String::new();
+        // (screen row, byte offset in `line`) for each row in the line
+        let mut segments: Vec<(u32, usize)> = Vec::new();
+
+        for (y, row_text) in rows.iter().enumerate() {
+            let y = y as u32;
+            segments.push((y, line.len()));
+            line.push_str(row_text);
+            if self.is_wrapped(y) && (y as usize) < rows.len() - 1 {
+                continue;
+            }
+
+            for m in regex.find_iter(&line).filter(|m| !m.is_empty()) {
+                let start = self.byte_to_cell(&rows, &segments, m.start())?;
+                let (row, col) = self.byte_to_cell(&rows, &segments, m.end() - 1)?;
+                matches.push(SearchMatch {
+                    start,
+                    end: (row, col + 1),
+                });
+            }
+            line.clear();
+            segments.clear();
+        }
+
+        Ok(matches)
+    }
+
+    fn is_wrapped(&self, y: u32) -> bool {
+        self.vt
+            .grid_ref(Point::Screen(PointCoordinate { x: 0, y }))
+            .and_then(|r| r.row())
+            .and_then(|r| r.is_wrapped())
+            .unwrap_or(false)
+    }
+
+    /// Convert a byte offset in a joined line to the screen cell holding it.
+    fn byte_to_cell(
+        &self,
+        rows: &[&str],
+        segments: &[(u32, usize)],
+        byte: usize,
+    ) -> Result<(u32, u16), Error> {
+        let i = segments.partition_point(|&(_, start)| start <= byte) - 1;
+        let (y, start) = segments[i];
+        let target = byte - start;
+        let row_text = rows[y as usize];
+
+        // Walk the row's cells, matching each one's text to the formatter output.
+        let cols = self.vt.cols()?;
+        let mut offset = 0;
+        let mut buf = ['\0'; 16];
+        for x in 0..cols {
+            let grid = self.vt.grid_ref(Point::Screen(PointCoordinate { x, y }))?;
+            let cell = grid.cell()?;
+            if matches!(cell.wide()?, CellWide::SpacerTail | CellWide::SpacerHead) {
+                continue;
+            }
+            let len = if cell.has_text()? {
+                let n = grid.graphemes(&mut buf)?;
+                buf[..n].iter().map(|c| c.len_utf8()).sum()
+            } else {
+                1
             };
-            if let Some(m) = self.search.current() {
-                self.scroll_to_match(m);
+            if target < offset + len {
+                return Ok((y, x));
             }
-        } else {
+            offset += len;
+            if offset >= row_text.len() {
+                break;
+            }
+        }
+        Ok((y, cols.saturating_sub(1)))
+    }
+
+    /// Adjust match rows for scrollback evicted since they were computed.
+    fn shift_matches(&mut self) {
+        let Some((anchor, row)) = &mut self.search_anchor else {
+            return;
+        };
+        let Some(now) = anchor.point(PointSpace::Screen).ok().flatten() else {
+            self.search.matches.clear();
             self.search.current_match = 0;
+            self.search_anchor = None;
+            return;
+        };
+        let shift = row.saturating_sub(now.y);
+        if shift == 0 {
+            return;
         }
-    }
+        *row = now.y;
 
-    /// Scroll to make the given match visible.
-    pub fn scroll_to_match(&mut self, m: SearchMatch) {
-        // The match was found at a specific scroll_offset with a specific view_row
-        // To center it, we want view_row to be near the middle of the screen
-        let (visible_rows, _) = self.parser.screen().size();
-        let half_screen = visible_rows as usize / 2;
-
-        // If view_row < half_screen, we need to scroll up (increase offset)
-        // If view_row > half_screen, we need to scroll down (decrease offset)
-        let adjustment = m.view_row as isize - half_screen as isize;
-        let new_offset = (m.scroll_offset as isize - adjustment)
-            .max(0)
-            .min(self.scrollback_len as isize) as usize;
-
-        self.parser.screen_mut().set_scrollback(new_offset);
-        self.scroll_offset = self.parser.screen().scrollback();
-    }
-
-    /// Find the index of the first match at or after the current view (for `/` forward search).
-    /// If no match exists after current position, wraps to the first match.
-    fn find_first_match_at_or_after_view(&self) -> usize {
-        if self.search.matches.is_empty() {
-            return 0;
+        if let Some((top, bottom)) = &mut self.search.origin {
+            *top = top.saturating_sub(shift);
+            *bottom = bottom.saturating_sub(shift);
         }
-
-        // A match is "at or after" current view if its scroll_offset <= current scroll_offset
-        // (lower offset = further down = newer content)
-        // Or if same offset, any view_row is fine
-        self.search
-            .matches
-            .iter()
-            .enumerate()
-            .find(|(_, m)| m.scroll_offset <= self.scroll_offset)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0) // Wrap to first match
-    }
-
-    /// Find the index of the last match at or before the current view (for `?` backward search).
-    /// If no match exists before current position, wraps to the last match.
-    fn find_last_match_at_or_before_view(&self) -> usize {
-        if self.search.matches.is_empty() {
-            return 0;
+        let evicted = self.search.matches.partition_point(|m| m.start.0 < shift);
+        self.search.matches.drain(..evicted);
+        for m in &mut self.search.matches {
+            m.start.0 -= shift;
+            m.end.0 -= shift;
         }
-
-        // A match is "at or before" current view if its scroll_offset >= current scroll_offset
-        // (higher offset = further up = older content)
-        self.search
-            .matches
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.scroll_offset >= self.scroll_offset)
-            .map(|(idx, _)| idx)
-            .unwrap_or(self.search.matches.len().saturating_sub(1)) // Wrap to last match
+        self.search.current_match = self.search.current_match.saturating_sub(evicted);
     }
 
-    /// Check if a view row/col at the current scroll position is the current search match.
-    pub fn is_current_match(&self, view_row: usize, col: usize) -> bool {
-        if let Some(m) = self.search.matches.get(self.search.current_match) {
-            self.match_is_visible(m, view_row, col)
+    /// `n` key: move in the search direction.
+    /// Forward search (`/`): n goes down (newer), N goes up (older)
+    /// Backward search (`?`): n goes up (older), N goes down (newer)
+    pub fn next_match(&mut self) {
+        let forward = self.search.direction == SearchDirection::Forward;
+        self.step_match(forward);
+    }
+
+    /// `N` key: move opposite to the search direction.
+    pub fn prev_match(&mut self) {
+        let forward = self.search.direction == SearchDirection::Backward;
+        self.step_match(forward);
+    }
+
+    fn step_match(&mut self, forward: bool) {
+        if self.search_stale {
+            self.update_search_matches();
+        }
+        let m = if forward {
+            self.search.move_forward()
         } else {
-            false
+            self.search.move_backward()
+        };
+        if let Some(m) = m {
+            self.scroll_to_match(m);
         }
     }
 
-    /// Check if a view row/col at the current scroll position is any search match.
-    pub fn is_any_match(&self, view_row: usize, col: usize) -> bool {
-        self.search
-            .matches
-            .iter()
-            .any(|m| self.match_is_visible(m, view_row, col))
+    /// Scroll so the match is near the middle of the viewport.
+    pub fn scroll_to_match(&mut self, m: SearchMatch) {
+        let half = self.size().0 as u32 / 2;
+        let row = m.start.0.saturating_sub(half);
+        self.vt.scroll_viewport(ScrollViewport::Row(row as usize));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search(t: &mut Terminal, pattern: &str) -> Vec<SearchMatch> {
+        t.search.set_pattern(pattern.into());
+        t.update_search_matches();
+        t.search.matches.clone()
     }
 
-    /// Check if a match is visible at the given view_row and col.
-    fn match_is_visible(&self, m: &SearchMatch, view_row: usize, col: usize) -> bool {
-        // A match at (scroll_offset=S, view_row=V) is visible at current scroll_offset=C
-        // When we scroll down (decrease offset), content moves up on screen.
-        // offset_diff = S - C (positive means match was found at higher/older scroll position)
-        // visible_view_row = V - offset_diff
-        // Example: match at offset=10, view_row=5. Current offset=8.
-        //   offset_diff = 10 - 8 = 2 (we scrolled down 2)
-        //   visible_view_row = 5 - 2 = 3 (content moved up 2 rows)
-        let offset_diff = m.scroll_offset as isize - self.scroll_offset as isize;
-        let visible_view_row = m.view_row as isize - offset_diff;
+    #[test]
+    fn search_spans_soft_wraps_and_wide_chars() {
+        let mut t = Terminal::new(4, 10, 1_000_000).unwrap();
+        t.process("xx日本abcdefgh\r\n".as_bytes());
+        // Row 0: "xx日本abcd" (10 cells), row 1: "efgh"
+        assert_eq!(
+            search(&mut t, "本ab"),
+            [SearchMatch {
+                start: (0, 4),
+                end: (0, 8)
+            }]
+        );
+        assert_eq!(
+            search(&mut t, "cdef"),
+            [SearchMatch {
+                start: (0, 8),
+                end: (1, 2)
+            }]
+        );
+    }
 
-        visible_view_row == view_row as isize && col >= m.start_col && col < m.end_col
+    #[test]
+    fn matches_follow_eviction() {
+        let mut t = Terminal::new(4, 120, 10_000).unwrap();
+        for i in 0..2000 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+        let pattern = r"line \d*7\b";
+        let first = search(&mut t, pattern)[0];
+        for i in 0..20 {
+            for j in 0..100 {
+                t.process(format!("more {i} {j}\r\n").as_bytes());
+            }
+            let shifted = t.search.matches.clone();
+            assert_eq!(shifted, search(&mut t, pattern));
+        }
+        assert_ne!(t.search.matches.first(), Some(&first));
     }
 }

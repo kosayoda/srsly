@@ -161,7 +161,7 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
 
     // Initialize app with terminal size (accounting for UI chrome)
     let (rows, cols) = ui::pane_inner_size(frame_size, Default::default());
-    let mut app = App::new(rows, cols);
+    let mut app = App::new(rows, cols)?;
 
     tui.enter(serial_rx)?;
 
@@ -266,7 +266,7 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
             },
         }
 
-        tui.draw(|frame| ui::render(frame, &app))?;
+        tui.draw(|frame| ui::render(frame, &mut app))?;
     }
 
     Ok(())

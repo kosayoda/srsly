@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::app::{App, ConnectionState, Focus, Layout as AppLayout, MessageLevel, Mode};
 use crate::terminal::{SearchDirection, Terminal};
+use libghostty_vt::style::{Style as CellStyle, StyleColor, Underline};
 
 /// Computed layout areas for the UI.
 pub struct UiLayout {
@@ -19,7 +20,7 @@ pub struct UiLayout {
 /// Parameters for rendering a terminal pane.
 struct PaneParams<'a> {
     title: &'a str,
-    terminal: &'a Terminal,
+    terminal: &'a mut Terminal,
     focused: bool,
     no_response: Option<std::time::Duration>,
 }
@@ -60,41 +61,32 @@ impl UiLayout {
 }
 
 /// Render the application UI.
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let layout = UiLayout::compute(frame.area(), app.layout);
 
     // Get "no response" warning for focused pane
     let no_response = app.waiting_for_response();
+    let focus = app.focus;
 
-    // Render kernel pane
     render_terminal_pane(
         frame,
         layout.kernel_pane,
         PaneParams {
             title: "Kernel",
-            terminal: &app.kernel_terminal,
-            focused: app.focus == Focus::Kernel,
-            no_response: if app.focus == Focus::Kernel {
-                no_response
-            } else {
-                None
-            },
+            terminal: &mut app.kernel_terminal,
+            focused: focus == Focus::Kernel,
+            no_response: no_response.filter(|_| focus == Focus::Kernel),
         },
     );
 
-    // Render app pane
     render_terminal_pane(
         frame,
         layout.app_pane,
         PaneParams {
             title: "App",
-            terminal: &app.app_terminal,
-            focused: app.focus == Focus::App,
-            no_response: if app.focus == Focus::App {
-                no_response
-            } else {
-                None
-            },
+            terminal: &mut app.app_terminal,
+            focused: focus == Focus::App,
+            no_response: no_response.filter(|_| focus == Focus::App),
         },
     );
 
@@ -102,10 +94,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_status_bar(frame, layout.status_bar, app);
 }
 
-/// Render a vt100 terminal pane.
+/// Render a terminal pane.
 fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
     let terminal = params.terminal;
-    let screen = terminal.screen();
 
     let border_style = if params.focused {
         Style::default().fg(Color::White)
@@ -145,65 +136,58 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, params: PaneParams) {
         return;
     }
 
-    // Build lines from the vt100 screen
-    let (rows, cols) = screen.size();
-    let mut lines: Vec<Line> = Vec::with_capacity(rows as usize);
+    let viewport = terminal.viewport();
+    let matches = terminal
+        .search
+        .visible(viewport.top, viewport.rows.len() as u16);
+    let current = terminal.search.current();
+    let buf = frame.buffer_mut();
 
-    for row in 0..rows.min(inner.height) {
-        let view_row = row as usize;
-        let mut spans: Vec<Span> = Vec::new();
-        let mut current_text = String::new();
-        let mut current_style = Style::default();
-
-        for col in 0..cols.min(inner.width) {
-            if let Some(cell) = screen.cell(row, col) {
-                // Check if this cell is part of a search match (using view row)
-                let in_current_match = terminal.is_current_match(view_row, col as usize);
-                let in_any_match = terminal.is_any_match(view_row, col as usize);
-
-                let cell_style = if in_current_match {
-                    // Current match: bright yellow background
-                    Style::default()
-                        .bg(Color::Yellow)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD)
-                } else if in_any_match {
-                    // Other matches: dimmer highlight
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    cell_to_style(cell)
-                };
-
-                if cell_style != current_style {
-                    if !current_text.is_empty() {
-                        spans.push(Span::styled(current_text.clone(), current_style));
-                        current_text.clear();
-                    }
-                    current_style = cell_style;
+    for (y, row) in viewport.rows.iter().enumerate().take(inner.height as usize) {
+        let screen_row = viewport.top + y as u32;
+        for cell in row.cells.iter().take_while(|c| c.col < inner.width) {
+            let style = if current.is_some_and(|m| m.contains(screen_row, cell.col)) {
+                // Current match: bright yellow background
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches.iter().any(|m| m.contains(screen_row, cell.col)) {
+                // Other matches: dimmer highlight
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                cell_style(&cell.style)
+            };
+            let style = match row.selection {
+                Some((start, end)) if (start..=end).contains(&cell.col) => {
+                    style.add_modifier(Modifier::REVERSED)
                 }
-
-                current_text.push_str(cell.contents());
-            }
+                _ => style,
+            };
+            let text = if cell.text.is_empty() {
+                " "
+            } else {
+                &cell.text
+            };
+            buf.set_stringn(
+                inner.x + cell.col,
+                inner.y + y as u16,
+                text,
+                (inner.width - cell.col) as usize,
+                style,
+            );
         }
-
-        if !current_text.is_empty() {
-            spans.push(Span::styled(current_text, current_style));
-        }
-
-        lines.push(Line::from(spans));
     }
 
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
-
     // Show cursor if focused
-    if params.focused && !screen.hide_cursor() {
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let cursor_x = inner.x + cursor_col.min(inner.width.saturating_sub(1));
-        let cursor_y = inner.y + cursor_row.min(inner.height.saturating_sub(1));
+    if params.focused
+        && let Some((x, y)) = viewport.cursor
+    {
+        let cursor_x = inner.x + x.min(inner.width.saturating_sub(1));
+        let cursor_y = inner.y + y.min(inner.height.saturating_sub(1));
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -359,38 +343,46 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(right, chunks[1]);
 }
 
-/// Convert a vt100 cell to a ratatui Style.
-fn cell_to_style(cell: &vt100::Cell) -> Style {
-    let mut style = Style::default();
+/// Convert a terminal cell style to a ratatui Style.
+fn cell_style(cell: &CellStyle) -> Style {
+    let mut style = Style::default()
+        .fg(color_to_ratatui(cell.fg_color))
+        .bg(color_to_ratatui(cell.bg_color));
 
-    style = style.fg(color_to_ratatui(cell.fgcolor()));
-    style = style.bg(color_to_ratatui(cell.bgcolor()));
-
-    if cell.bold() {
+    if cell.bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if cell.dim() {
+    if cell.faint {
         style = style.add_modifier(Modifier::DIM);
     }
-    if cell.italic() {
+    if cell.italic {
         style = style.add_modifier(Modifier::ITALIC);
     }
-    if cell.underline() {
+    if cell.underline != Underline::None {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
-    if cell.inverse() {
+    if cell.inverse {
         style = style.add_modifier(Modifier::REVERSED);
+    }
+    if cell.invisible {
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    if cell.strikethrough {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if cell.blink {
+        style = style.add_modifier(Modifier::SLOW_BLINK);
     }
 
     style
 }
 
-/// Convert a vt100 color to a ratatui Color.
-fn color_to_ratatui(color: vt100::Color) -> Color {
+/// Convert a terminal color to a ratatui Color.
+fn color_to_ratatui(color: StyleColor) -> Color {
     match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(idx) => Color::Indexed(idx),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        StyleColor::None => Color::Reset,
+        StyleColor::Palette(idx) => Color::Indexed(idx.0),
+        StyleColor::Rgb(c) => Color::Rgb(c.r, c.g, c.b),
     }
 }
 
