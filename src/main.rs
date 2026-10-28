@@ -1,3 +1,6 @@
+use std::io::Write;
+
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -33,6 +36,10 @@ enum Command {
         /// Baud rate
         #[arg(short, long, default_value_t = 115200)]
         baud: u32,
+
+        /// Append each pane's raw output to app.log and kernel.log in this directory
+        #[arg(short, long)]
+        log: Option<Utf8PathBuf>,
     },
 }
 
@@ -46,16 +53,16 @@ async fn main() -> Result<()> {
         Some(Command::List) => {
             list_ports();
         }
-        Some(Command::Connect { port, baud }) => {
+        Some(Command::Connect { port, baud, log }) => {
             let port = match port {
                 Some(p) => p,
                 None => select_port()?,
             };
-            run_connect(&port, baud).await?;
+            run_connect(&port, baud, log.as_deref()).await?;
         }
         None => {
             let port = select_port()?;
-            run_connect(&port, 115200).await?;
+            run_connect(&port, 115200, None).await?;
         }
     }
 
@@ -145,7 +152,9 @@ fn list_ports() {
     }
 }
 
-async fn run_connect(port: &str, baud: u32) -> Result<()> {
+async fn run_connect(port: &str, baud: u32, log: Option<&Utf8Path>) -> Result<()> {
+    let mut logs = log.map(Logs::open).transpose()?;
+
     // Serial configuration (kept for reconnection)
     let serial_config = SerialConfig::new(port, baud);
 
@@ -213,11 +222,17 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
                 tui.set_autoscroll(app.autoscrolling());
             }
             Event::AppData(data) => {
+                if let Some(logs) = &mut logs {
+                    logs.app.write_all(&data)?;
+                }
                 app.record_receive();
                 tui.set_no_response_deadline(None);
                 app.app_terminal.process(&data);
             }
             Event::KernelData(data) => {
+                if let Some(logs) = &mut logs {
+                    logs.kernel.write_all(&data)?;
+                }
                 app.record_receive();
                 tui.set_no_response_deadline(None);
                 app.kernel_terminal.process(&data);
@@ -315,6 +330,28 @@ async fn run_connect(port: &str, baud: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Raw output logs for each pane.
+struct Logs {
+    app: std::fs::File,
+    kernel: std::fs::File,
+}
+
+impl Logs {
+    fn open(dir: &Utf8Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let open = |name| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(name))
+        };
+        Ok(Self {
+            app: open("app.log")?,
+            kernel: open("kernel.log")?,
+        })
+    }
 }
 
 /// A pager showing an exported pane, and the temp file it reads.
